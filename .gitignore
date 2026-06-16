@@ -1,0 +1,42 @@
+# Region-specific staging copy with fully-vendored botocore/boto3 + a
+# lambda_function.py that still carries old hardcoded creds. Not source —
+# never track it.
+_us-east-1/
+
+# Per-lambda build staging (deploy.sh assembles wheels + a copy of the
+# handler here). Generated artifacts, and the copied handler still contains
+# pre-sanitisation creds until the next build — keep it out of git.
+**/.build/
+.build/
+
+# Build outputs / packaged zips
+*.zip
+
+# Vendored python dependencies bundled into a lambda dir by deploy.sh
+# (requests/urllib3/certifi/idna/charset_normalizer + their dist-info, plus
+# compiled .so / bin). These are installed at build time, not source.
+**/certifi/
+**/certifi-*.dist-info/
+**/charset_normalizer/
+**/charset_normalizer-*.dist-info/
+**/idna/
+**/idna-*.dist-info/
+**/requests/
+**/requests-*.dist-info/
+**/urllib3/
+**/urllib3-*.dist-info/
+**/bin/
+*.so
+
+# Python caches / compiled
+__pycache__/
+*.pyc
+*.pyo
+
+# Per-lambda AWS config snapshots written by deploy.sh (may contain account
+# / role / arn details that don't belong in source control)
+**/_aws_config.json
+
+# OS / editor cruft
+.DS_Store
+*.swp
