@@ -27,15 +27,42 @@ logger = logging.getLogger(__name__)
 # constants
 base_url = "https://eportal.incometax.gov.in/iec"
 
-headers = {"Accept": "application/json, text/plain, */*", "Content-Type": "application/json", 'User-Agent': "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "Host": "eportal.incometax.gov.in", "Referer":"https://eportal.incometax.gov.in/iec/foservices/", "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"', "Sec-Fetch-Mode": "cors", "Sec-Fetch-Mode": "same-origin", "Sec-Ch-Ua-Platform": "Linux", "Sec-Ch-Ua-Mobile": "?0"}
+headers = {"Accept": "application/json, text/plain, */*", "Content-Type": "application/json", 'User-Agent': "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "Host": "eportal.incometax.gov.in", "Origin": "https://eportal.incometax.gov.in", "Referer":"https://eportal.incometax.gov.in/iec/foservices/", "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"', "Sec-Fetch-Mode": "cors", "Sec-Fetch-Mode": "same-origin", "Sec-Ch-Ua-Platform": "Linux", "Sec-Ch-Ua-Mobile": "?0"}
+
+
+def headers_with_sn(service_name):
+    """Base headers + the `sn` header the income-tax portal now requires on
+    each API call (equal to the body's serviceName). A real browser sends
+    `sn: <serviceName>` on every returnservices/login/servicesapi call; the
+    portal's newer routing expects it. File downloads + /document/order carry
+    no serviceName, so they get no `sn` (pass service_name=None or skip)."""
+    h = dict(headers)
+    if service_name:
+        h["sn"] = service_name
+    return h
 
 # (connect, read) timeout. A short CONNECT timeout means a dropped/refused
 # connection fails fast (~6s) instead of hanging on the old single 30s value;
 # the read timeout stays generous for slow document streaming.
 timeout_sec = (6, 45)
 
-MAX_RETRIES = 3
-RETRY_DELAY = 2  # seconds between retries
+MAX_RETRIES = max(1, int(os.environ.get("MAX_RETRIES", "3")))
+RETRY_DELAY = max(1, int(os.environ.get("RETRY_DELAY", "2")))  # seconds between retries
+
+# HTTP codes the income-tax portal returns when the session has expired /
+# been invalidated. 440 is the portal's "Login Timeout" — retrying the SAME
+# dead session is futile; the session must be refreshed first.
+SESSION_EXPIRED_CODES = (401, 403, 440)
+
+# How often the background keep-alive pings extendSession to stop the portal
+# expiring an idle session mid-run. Env-tunable (0 disables keep-alive).
+SESSION_KEEPALIVE_SECONDS = int(os.environ.get("SESSION_KEEPALIVE_SECONDS", "60"))
+
+# Per-file download attempts and how many extra rounds to re-run the items
+# (proceedings / notices / demands) that still failed after the first pass.
+# Env-tunable so a throttled account can be dialed down without a redeploy.
+FILE_DOWNLOAD_ATTEMPTS = max(1, int(os.environ.get("FILE_DOWNLOAD_ATTEMPTS", "5")))
+PROCEEDING_RETRY_ROUNDS = max(0, int(os.environ.get("PROCEEDING_RETRY_ROUNDS", "2")))
 
 # ---------------------------------------------------------------------------
 # Shared HTTP session — connection pooling + keep-alive.
@@ -91,47 +118,94 @@ def http_session():
                 _http_session = s
     return _http_session
 
-# AWS S3 Configuration. Credentials are NOT hardcoded — they come from the
-# Lambda execution role by default (the role carries finbuddy-lambda-s3-policy).
-# Explicit keys are honoured only if AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-# are set as env vars (local/dev), otherwise boto3 resolves the role creds.
+# AWS S3 Configuration.
+# Credential precedence: System Configuration (event s3_config) → env vars →
+# the Lambda execution ROLE. No credentials are hard-coded in source — when no
+# explicit key is supplied, boto3 falls back to the function's execution role
+# (which carries the S3 + logs permissions). To pin specific keys, set them in
+# System Configuration or as the function's environment variables; never in code.
 AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "nabsprodbucket")
+
+# Per-invocation S3 config delivered in the event payload (s3_config) by the
+# orchestrator, sourced from FastAPI's System Configuration. lambda_handler
+# calls configure_s3() to populate this BEFORE any upload.
+_S3_CONFIG = {}
 
 # Shared S3 client (reused across uploads to avoid per-call initialization overhead)
 _s3_client = None
 
+
+def configure_s3(s3_config):
+    """Apply event-provided S3 config (keys/region/bucket) from System
+    Configuration. Resets the cached client so the next _get_s3_client() picks
+    up the supplied credentials. No-op if s3_config is empty."""
+    global _S3_CONFIG, _s3_client, S3_BUCKET, AWS_REGION
+    if not s3_config:
+        return
+    _S3_CONFIG = dict(s3_config)
+    if _S3_CONFIG.get("region"):
+        AWS_REGION = _S3_CONFIG["region"]
+    if _S3_CONFIG.get("bucket"):
+        S3_BUCKET = _S3_CONFIG["bucket"]
+    _s3_client = None  # force rebuild with the new creds
+
+
 def _get_s3_client():
     """Get or create a shared S3 client (saves ~0.5s per upload vs creating new client each time).
-    Uses the Lambda execution role's credentials unless explicit AWS keys are
-    provided via env vars — never hardcoded."""
+    Credential precedence:
+      1. event s3_config (System Configuration, via configure_s3)
+      2. AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars (local/dev)
+      3. the Lambda execution role (when no explicit key is supplied — boto3
+         resolves it automatically; this is the production/UAT path)."""
     global _s3_client
     if _s3_client is None:
         kwargs = {"region_name": AWS_REGION, "config": Config(signature_version='s3v4')}
-        ak = os.environ.get("AWS_ACCESS_KEY_ID")
-        sk = os.environ.get("AWS_SECRET_ACCESS_KEY")
+        ak = (_S3_CONFIG.get("aws_access_key_id")
+              or os.environ.get("AWS_ACCESS_KEY_ID"))
+        sk = (_S3_CONFIG.get("aws_secret_access_key")
+              or os.environ.get("AWS_SECRET_ACCESS_KEY"))
         if ak and sk:
             kwargs["aws_access_key_id"] = ak
             kwargs["aws_secret_access_key"] = sk
+        # else: no explicit keys → boto3 uses the Lambda execution role.
         _s3_client = boto3.client('s3', **kwargs)
     return _s3_client
 
 
-def retry_request(method, url, max_retries=MAX_RETRIES, **kwargs):
-    """Make an HTTP request with retry logic for transient failures."""
+def retry_request(method, url, max_retries=MAX_RETRIES, session=None, **kwargs):
+    """Make an HTTP request with retry logic for transient failures.
+
+    When `session` (a SessionHolder) is given and the portal returns a
+    session-expired status (401/403/440 — 440 is its "Login Timeout"), refresh
+    the login ONCE and retry with fresh cookies instead of blind-retrying the
+    dead session. The refresh does not count against the transient-retry budget.
+    """
     kwargs.setdefault('timeout', timeout_sec)
-    last_error = None
     _sess = http_session()
+    refreshed = False
     for attempt in range(1, max_retries + 1):
         try:
             if method == 'post':
                 resp = _sess.post(url, **kwargs)
             else:
                 resp = _sess.get(url, **kwargs)
+
+            # Session-expired → refresh ONCE and retry with the new cookies.
+            if resp.status_code in SESSION_EXPIRED_CODES and session is not None and not refreshed:
+                refreshed = True
+                logger.warning(
+                    f"Session expired (HTTP {resp.status_code}) on {url}, refreshing login and retrying..."
+                )
+                new_cookies = session.refresh()
+                if new_cookies is not None:
+                    kwargs['cookies'] = new_cookies.cookies
+                time.sleep(1)
+                continue
+
             resp.raise_for_status()
             return resp
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.HTTPError) as e:
-            last_error = e
             if attempt < max_retries:
                 logger.warning(f"Request attempt {attempt}/{max_retries} failed for {url}: {str(e)}. Retrying in {RETRY_DELAY}s...")
                 time.sleep(RETRY_DELAY * attempt)  # exponential backoff
@@ -268,9 +342,10 @@ def login_user_via_apis(username, password, client_name):
 
     try:
         # Step 1: Verify username
-        res_1 = http_session().post(
+        res_1 = retry_request(
+            "post",
             f"{base_url}/loginapi/login",
-            headers=headers, timeout=timeout_sec,
+            headers=headers_with_sn("wLoginService"), timeout=timeout_sec,
             json={
                 "entity": username, "serviceName": "wLoginService"
             })
@@ -305,9 +380,10 @@ def login_user_via_apis(username, password, client_name):
         # Keep the shared lambda's behaviour verbatim: wait once, POST once.
         time.sleep(12)  # Wait for Income Tax API to process reqId
 
-        main_response = http_session().post(
+        main_response = retry_request(
+            "post",
             f"{base_url}/loginapi/login",
-            headers=headers,
+            headers=headers_with_sn("loginService"),
             timeout=timeout_sec,
             json=login_data
         )
@@ -352,9 +428,10 @@ def login_user_via_apis(username, password, client_name):
 
                 logger.info("Session already active, creating new session")
 
-                main_response = http_session().post(
+                main_response = retry_request(
+                    "post",
                     f"{base_url}/loginapi/login",
-                    headers=headers,
+                    headers=headers_with_sn("loginService"),
                     timeout=timeout_sec,
                     json=continue_data
                 )
@@ -384,16 +461,67 @@ def login_user_via_apis(username, password, client_name):
         return None, errors
 
 
+def extend_session(login_cookies, username, client_name):
+    """Extend the EXISTING auth session (cheap, reuses cookies, avoids the
+    fragile full login the portal often RemoteDisconnects for busy accounts).
+    POST /loginapi/auth/extendSession, header sn:NA, body {loggedInUserId: PAN}.
+    200 = session kept alive."""
+    if not login_cookies:
+        return False
+    try:
+        resp = requests.post(
+            f"{base_url}/loginapi/auth/extendSession",
+            json={"loggedInUserId": username},
+            headers=headers_with_sn("NA"),
+            cookies=login_cookies.cookies,
+            timeout=timeout_sec,
+        )
+        if resp.status_code == 200:
+            logger.info(f"Session extended for {client_name}")
+            return True
+        logger.warning(f"extendSession returned HTTP {resp.status_code} for {client_name}")
+    except Exception as e:
+        logger.warning(f"extendSession failed for {client_name}: {e}")
+    return False
+
+
 def refresh_login_cookies(login_cookies, username, password, client_name):
-    """Re-login if session expired, returns new cookies or original if re-login fails"""
+    """Refresh the session: try the cheap extendSession FIRST, then fall back to
+    a full re-login. Returns new cookies (or the original if both fail)."""
+    if extend_session(login_cookies, username, client_name):
+        return login_cookies
     try:
         new_cookies, login_errors = login_user_via_apis(username, password, client_name)
         if new_cookies:
-            logger.info(f"Session refreshed successfully for {client_name}")
+            logger.info(f"Session refreshed (re-login) successfully for {client_name}")
             return new_cookies
     except Exception as e:
         logger.error(f"Session refresh failed for {client_name}: {e}")
     return login_cookies
+
+
+class SessionHolder:
+    """Thread-safe wrapper around the shared login session. `.cookies` always
+    returns the latest session object; `.refresh()` extends/re-logs-in under a
+    lock so a refresh by one worker is atomic and visible to all the others."""
+
+    def __init__(self, login_cookies, username, password, client_name):
+        self._login_cookies = login_cookies
+        self._username = username
+        self._password = password
+        self._client_name = client_name
+        self._lock = threading.Lock()
+
+    @property
+    def cookies(self):
+        return self._login_cookies
+
+    def refresh(self):
+        with self._lock:
+            self._login_cookies = refresh_login_cookies(
+                self._login_cookies, self._username, self._password, self._client_name
+            )
+            return self._login_cookies
 
 
 def _download_one_document(doc_id, link_text, full_file_path, file_info,
@@ -408,9 +536,10 @@ def _download_one_document(doc_id, link_text, full_file_path, file_info,
     (reply_files / notice_letter assignment stays on the calling thread), so
     concurrent calls for different files of one notice don't race.
 
-    Mirrors the original per-file retry semantics verbatim: 3 attempts, 401/403
-    → refresh-login-and-retry, non-200 → backoff-and-retry, success → save +
-    S3 upload.
+    Mirrors the original per-file retry semantics: FILE_DOWNLOAD_ATTEMPTS
+    attempts, 401/403/440 → refresh-login-and-retry (via the shared holder when
+    one is supplied in cookies_box["session"]), non-200 → backoff-and-retry,
+    success → save + S3 upload.
     """
     if not full_file_path:
         file_info['downloaded'] = False
@@ -418,7 +547,8 @@ def _download_one_document(doc_id, link_text, full_file_path, file_info,
         return file_info
 
     download_success = False
-    for dl_attempt in range(1, 4):  # 3 attempts
+    _holder = cookies_box.get("session")
+    for dl_attempt in range(1, FILE_DOWNLOAD_ATTEMPTS + 1):
         try:
             file_res = http_session().get(
                 f"{base_url}/document/{doc_id}",
@@ -426,18 +556,21 @@ def _download_one_document(doc_id, link_text, full_file_path, file_info,
                 cookies=cookies_box["cookies"].cookies,
             )
 
-            # Session expired - refresh and retry
-            if file_res.status_code in (401, 403) and password:
+            # Session expired - refresh (atomic, via the shared holder) and retry
+            if file_res.status_code in SESSION_EXPIRED_CODES and password:
                 logger.warning(f"Session expired (HTTP {file_res.status_code}) on {label}, refreshing login...")
                 with dl_lock:
-                    cookies_box["cookies"] = refresh_login_cookies(
-                        cookies_box["cookies"], username, password, client_name)
+                    if _holder is not None:
+                        cookies_box["cookies"] = _holder.refresh()
+                    else:
+                        cookies_box["cookies"] = refresh_login_cookies(
+                            cookies_box["cookies"], username, password, client_name)
                 continue
 
             # IT portal custom error or server error - retry
             if file_res.status_code != 200:
-                logger.warning(f"{label} download attempt {dl_attempt}/3 failed: {link_text}, Status Code: {file_res.status_code}")
-                if dl_attempt < 3:
+                logger.warning(f"{label} download attempt {dl_attempt}/{FILE_DOWNLOAD_ATTEMPTS} failed: {link_text}, Status Code: {file_res.status_code}")
+                if dl_attempt < FILE_DOWNLOAD_ATTEMPTS:
                     time.sleep(dl_attempt * 2)
                 continue
 
@@ -460,17 +593,17 @@ def _download_one_document(doc_id, link_text, full_file_path, file_info,
             break  # success, exit retry loop
 
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-            logger.warning(f"{label} download attempt {dl_attempt}/3 connection error: {link_text}: {e}")
-            if dl_attempt < 3:
+            logger.warning(f"{label} download attempt {dl_attempt}/{FILE_DOWNLOAD_ATTEMPTS} connection error: {link_text}: {e}")
+            if dl_attempt < FILE_DOWNLOAD_ATTEMPTS:
                 time.sleep(dl_attempt * 2)
         except Exception as e:
             logger.error(f"{label} download unexpected error: {link_text}: {e}")
             break  # don't retry unknown errors
 
     if not download_success:
-        logger.error(f"{label} download FAILED after 3 attempts: {link_text}")
+        logger.error(f"{label} download FAILED after {FILE_DOWNLOAD_ATTEMPTS} attempts: {link_text}")
         file_info['downloaded'] = False
-        file_info['error'] = 'Failed after 3 download attempts'
+        file_info['error'] = f'Failed after {FILE_DOWNLOAD_ATTEMPTS} download attempts'
     return file_info
 
 
@@ -495,6 +628,11 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
     e_proceedings_data = []
     errors = []
 
+    # Shared session holder: a session-expired (440/401/403) response on any
+    # worker call refreshes the login ONCE under a lock and all callers see the
+    # fresh cookies via the holder.
+    session = SessionHolder(login_cookies, username, password, client_name)
+
     try:
         res_4 = retry_request('post', f"{base_url}/returnservicesapi/auth/getEntity", json={
             "serviceName": "eProceedingsPaginatedService",
@@ -512,7 +650,7 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
             "header": {
                 "formName": "FO-041_PCDNG"
             }},
-            headers=headers, cookies=login_cookies.cookies)
+            headers=headers_with_sn("eProceedingsPaginatedService"), cookies=session.cookies.cookies, session=session)
 
         res_4_data = res_4.json()
         e_proceedings_group = (res_4_data.get('eProceedingPaginatedRequests') or []) if res_4_data else []
@@ -577,7 +715,7 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                         "header": {
                             "formName": "FO-041_PCDNG"
                         }
-                    }, cookies=login_cookies.cookies)
+                    }, headers=headers_with_sn("eProceedingDetailsService"), cookies=session.cookies.cookies, session=session)
                     res_5_data = res_5.json()
 
                     if not res_5_data:
@@ -604,7 +742,11 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                     # genuinely-shared mutables (`downloaded_files` dedup set and
                     # `login_cookies` on session-refresh) are guarded by locks.
                     _dl_lock = threading.Lock()
-                    _cookies_box = {"cookies": login_cookies}
+                    # Back the cookie box by the shared holder so refreshes are
+                    # atomic + visible to all download workers. Readers keep using
+                    # _cookies_box["cookies"]; refreshes go through session.refresh()
+                    # and re-sync the box (see _download_one_document).
+                    _cookies_box = {"cookies": session.cookies, "session": session}
 
                     def _process_single_notice(notice):
                         local_errors = []
@@ -643,7 +785,7 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                                     "header": {
                                         "formName": "FO-041_PCDNG"
                                     }
-                                }, cookies=_cookies_box["cookies"].cookies, headers=headers)
+                                }, cookies=_cookies_box["cookies"].cookies, headers=headers_with_sn("itbaResponseService"), session=session)
 
                                 res_6_data = res_6.json()
                                 remark_notice_list = res_6_data.get('respRemrkAttLst', None)
@@ -715,7 +857,7 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                                 }
                             }
                             res_7 = retry_request('post', f"{base_url}/returnservicesapi/auth/saveEntity",
-                                json=notice_pdf_payload, headers=headers, cookies=_cookies_box["cookies"].cookies)
+                                json=notice_pdf_payload, headers=headers_with_sn("noticeletterpdf"), cookies=_cookies_box["cookies"].cookies, session=session)
 
                             res_7_data = res_7.json()
                             documents_res_7 = res_7_data.get("docMap", None)
@@ -727,7 +869,7 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                                     logger.warning(f"Empty docMap for notice {unique_e_pro_notice_id}, retry {docmap_attempt}/3 after {wait_time}s...")
                                     time.sleep(wait_time)
                                     res_7 = retry_request('post', f"{base_url}/returnservicesapi/auth/saveEntity",
-                                        json=notice_pdf_payload, headers=headers, cookies=_cookies_box["cookies"].cookies)
+                                        json=notice_pdf_payload, headers=headers_with_sn("noticeletterpdf"), cookies=_cookies_box["cookies"].cookies, session=session)
                                     res_7_data = res_7.json()
                                     documents_res_7 = res_7_data.get("docMap", None)
                                     if documents_res_7:
@@ -861,6 +1003,10 @@ def fetch_demands(login_cookies, username, client_name, download_dir=".", downlo
     demands_data = []
     errors = []
 
+    # Shared session holder so a session-expired (440/401/403) response refreshes
+    # the login ONCE and the fresh cookies are reused for the demand downloads.
+    session = SessionHolder(login_cookies, username, password, client_name)
+
     try:
         res = retry_request('post',
             f"{base_url}/servicesapi/auth/getEntity",
@@ -868,8 +1014,9 @@ def fetch_demands(login_cookies, username, client_name, download_dir=".", downlo
                 "pan": username,
                 "serviceName": "outstandingDemand"
             },
-            headers=headers,
-            cookies=login_cookies.cookies
+            headers=headers_with_sn("outstandingDemand"),
+            cookies=session.cookies.cookies,
+            session=session
         )
 
         res_data = res.json()
@@ -911,28 +1058,37 @@ def fetch_demands(login_cookies, username, client_name, download_dir=".", downlo
                 }
 
                 if download_dir and unique_file_name not in downloaded_files:
-                    try:
-                        order_id = base64.b64encode(out_file_path.encode()).decode()
-                        file_res = http_session().post(f"{base_url}/document/order", json={
-                            "order": order_id
-                        }, headers=headers, timeout=timeout_sec, cookies=login_cookies.cookies)
-
-                        # Session expired - try refresh and retry
-                        if file_res.status_code in (401, 403) and password:
-                            logger.warning(f"Session expired (HTTP {file_res.status_code}), refreshing login for demand download...")
-                            login_cookies = refresh_login_cookies(login_cookies, username, password, client_name)
+                    order_id = base64.b64encode(out_file_path.encode()).decode()
+                    demand_download_success = False
+                    # Mirror the notice-file loop: multiple attempts with backoff,
+                    # 401/403/440 → refresh ONCE via the shared holder and retry,
+                    # non-200 / ConnectionError / Timeout → backoff-and-retry.
+                    for dl_attempt in range(1, FILE_DOWNLOAD_ATTEMPTS + 1):
+                        try:
                             file_res = http_session().post(f"{base_url}/document/order", json={
                                 "order": order_id
-                            }, headers=headers, timeout=timeout_sec, cookies=login_cookies.cookies)
+                            }, headers=headers, timeout=timeout_sec, cookies=session.cookies.cookies)
 
-                        file_res.raise_for_status()
+                            # Session expired - refresh (atomic) and retry
+                            if file_res.status_code in SESSION_EXPIRED_CODES and password:
+                                logger.warning(f"Session expired (HTTP {file_res.status_code}), refreshing login for demand download...")
+                                session.refresh()
+                                continue
 
-                        if file_res and file_res.status_code == 200:
+                            # Non-200 (portal/server error) - backoff and retry
+                            if file_res.status_code != 200:
+                                logger.warning(f"Demand file download attempt {dl_attempt}/{FILE_DOWNLOAD_ATTEMPTS} failed: {unique_file_name}, Status Code: {file_res.status_code}")
+                                if dl_attempt < FILE_DOWNLOAD_ATTEMPTS:
+                                    time.sleep(dl_attempt * 2)
+                                continue
+
+                            # Success - save file
                             file_bytes = file_res.content
                             with open(full_file_path, "wb") as f:
                                 f.write(file_bytes)
                             logger.info(f"Demand file saved: {unique_file_name}")
                             file_info['downloaded'] = True
+                            demand_download_success = True
 
                             # Upload to S3
                             try:
@@ -943,15 +1099,24 @@ def fetch_demands(login_cookies, username, client_name, download_dir=".", downlo
                             except Exception as s3_error:
                                 logger.error(f"Error uploading demand file to S3: {s3_error}")
                                 file_info['s3_error'] = str(s3_error)
-                        else:
-                            logger.warning(f"Failed to download demand file: {file_res.status_code}")
+                            break  # success, exit retry loop
+
+                        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                            logger.warning(f"Demand file download attempt {dl_attempt}/{FILE_DOWNLOAD_ATTEMPTS} connection error: {unique_file_name}: {e}")
+                            if dl_attempt < FILE_DOWNLOAD_ATTEMPTS:
+                                time.sleep(dl_attempt * 2)
+                        except Exception as e:
+                            error_msg = f"Error downloading demand file: {str(e)}"
+                            logger.error(error_msg)
                             file_info['downloaded'] = False
-                    except Exception as e:
-                        error_msg = f"Error downloading demand file: {str(e)}"
-                        logger.error(error_msg)
+                            file_info['error'] = str(e)
+                            errors.append({"type": "demand_file", "din": demand.get('din'), "error": error_msg})
+                            break  # don't retry unknown errors
+
+                    if not demand_download_success and not file_info.get('error'):
+                        logger.warning(f"Failed to download demand file after {FILE_DOWNLOAD_ATTEMPTS} attempts: {unique_file_name}")
                         file_info['downloaded'] = False
-                        file_info['error'] = str(e)
-                        errors.append({"type": "demand_file", "din": demand.get('din'), "error": error_msg})
+                        file_info['error'] = f'Failed after {FILE_DOWNLOAD_ATTEMPTS} download attempts'
                 else:
                     file_info['downloaded'] = False
                     file_info['skipped'] = True
@@ -1036,57 +1201,72 @@ def fetch_income_tax_notices_via_api(username, password, client_name, downloaded
 
     result['success'] = True
 
-    # Fetch demands
+    # Background keep-alive: ping extendSession every SESSION_KEEPALIVE_SECONDS
+    # so the portal doesn't expire an idle session mid-run. Daemon thread, always
+    # stopped in the finally below so it never outlives the fetch.
+    _keepalive_stop = threading.Event()
+
+    def _session_keepalive():
+        while not _keepalive_stop.wait(SESSION_KEEPALIVE_SECONDS):
+            extend_session(login_cookies, username, client_name)
+
+    if SESSION_KEEPALIVE_SECONDS > 0:
+        threading.Thread(target=_session_keepalive, daemon=True).start()
+
     try:
-        demands_result = fetch_demands(login_cookies, username, client_name, download_dir, downloaded_files, password=password)
-        result['demands'] = demands_result
-        if demands_result.get('errors'):
-            result['errors'].extend(demands_result['errors'])
-    except Exception as e:
-        error_msg = f"Error in fetch_demands: {str(e)}"
-        logger.error(error_msg)
-        result['errors'].append({"type": "demands", "error": error_msg})
+        # Fetch demands
+        try:
+            demands_result = fetch_demands(login_cookies, username, client_name, download_dir, downloaded_files, password=password)
+            result['demands'] = demands_result
+            if demands_result.get('errors'):
+                result['errors'].extend(demands_result['errors'])
+        except Exception as e:
+            error_msg = f"Error in fetch_demands: {str(e)}"
+            logger.error(error_msg)
+            result['errors'].append({"type": "demands", "error": error_msg})
 
-    # Fetch e-proceedings (paginated) for all 4 combinations
-    proceeding_variants = [
-        {"fyi": False, "third_party": False, "label": "FYA/Self"},
-        {"fyi": True, "third_party": False, "label": "FYI/Self"},
-        {"fyi": False, "third_party": True, "label": "FYA/ThirdParty"},
-        {"fyi": True, "third_party": True, "label": "FYI/ThirdParty"},
-    ]
+        # Fetch e-proceedings (paginated) for all 4 combinations
+        proceeding_variants = [
+            {"fyi": False, "third_party": False, "label": "FYA/Self"},
+            {"fyi": True, "third_party": False, "label": "FYI/Self"},
+            {"fyi": False, "third_party": True, "label": "FYA/ThirdParty"},
+            {"fyi": True, "third_party": True, "label": "FYI/ThirdParty"},
+        ]
 
-    for variant in proceeding_variants:
-        page_no = 1
-        while True:
-            try:
-                e_proceedings_result = fetch_e_proceedings(
-                    login_cookies, username, client_name, page_no, download_dir, downloaded_files,
-                    fyi=variant["fyi"], third_party=variant["third_party"],
-                    existing_notice_ids=existing_notice_ids_set,
-                    password=password,
-                    file_download_concurrency=file_download_concurrency
-                )
-                logger.info(f"Fetched Page-{page_no} E Proceedings ({variant['label']})")
+        for variant in proceeding_variants:
+            page_no = 1
+            while True:
+                try:
+                    e_proceedings_result = fetch_e_proceedings(
+                        login_cookies, username, client_name, page_no, download_dir, downloaded_files,
+                        fyi=variant["fyi"], third_party=variant["third_party"],
+                        existing_notice_ids=existing_notice_ids_set,
+                        password=password,
+                        file_download_concurrency=file_download_concurrency
+                    )
+                    logger.info(f"Fetched Page-{page_no} E Proceedings ({variant['label']})")
 
-                result['e_proceedings'].extend(e_proceedings_result.get('data', []))
-                if e_proceedings_result.get('errors'):
-                    result['errors'].extend(e_proceedings_result['errors'])
+                    result['e_proceedings'].extend(e_proceedings_result.get('data', []))
+                    if e_proceedings_result.get('errors'):
+                        result['errors'].extend(e_proceedings_result['errors'])
 
-                result['total_pages_fetched'] += 1
+                    result['total_pages_fetched'] += 1
 
-                # Check if more pages exist
-                if not e_proceedings_result.get('count') or e_proceedings_result['count'] != 50:
-                    logger.info(f"No more pages for {variant['label']}.")
+                    # Check if more pages exist
+                    if not e_proceedings_result.get('count') or e_proceedings_result['count'] != 50:
+                        logger.info(f"No more pages for {variant['label']}.")
+                        break
+
+                    page_no += 1
+                except Exception as e:
+                    error_msg = f"Error fetching e-proceedings page {page_no} ({variant['label']}): {str(e)}"
+                    logger.error(error_msg)
+                    result['errors'].append({"type": "e_proceedings_page", "page": page_no, "variant": variant['label'], "error": error_msg})
                     break
 
-                page_no += 1
-            except Exception as e:
-                error_msg = f"Error fetching e-proceedings page {page_no} ({variant['label']}): {str(e)}"
-                logger.error(error_msg)
-                result['errors'].append({"type": "e_proceedings_page", "page": page_no, "variant": variant['label'], "error": error_msg})
-                break
-
-    return result
+        return result
+    finally:
+        _keepalive_stop.set()
 
 
 # Lambda handler function
@@ -1139,6 +1319,10 @@ def lambda_handler(event, context):
     """
     handler_start_time = time.time()
     try:
+        # Apply S3 credentials/config from the event (FastAPI System
+        # Configuration, forwarded by the orchestrator) BEFORE any upload.
+        configure_s3(event.get('s3_config'))
+
         username = event.get('username')
         password = event.get('password')
         client_name = event.get('client_name')
