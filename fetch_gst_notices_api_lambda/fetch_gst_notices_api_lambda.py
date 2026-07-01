@@ -308,6 +308,37 @@ def _parse_doc_descriptors(item_json_str):
     return found
 
 
+def _parse_item_dates(item_json_str):
+    """Pull notice-level dates + section out of a case-item's itemJson.
+
+    (Self-contained copy of the backend app/features/fetch_gst_notices.py
+    helper — keep in sync.) Issue Date <- todtls.dt; Due Date <- sdtls.*.duedt;
+    Section <- sdtls.*.sec. The row's top-level insertDate/updateDate are only
+    save timestamps, NOT the notice dates. Returns DD/MM/YYYY strings ("" when
+    absent); the caller cleans via _clean_date.
+    """
+    out = {"issue_date": "", "due_date": "", "section": ""}
+    try:
+        parsed = json.loads(item_json_str)
+    except Exception:
+        return out
+    if not isinstance(parsed, dict):
+        return out
+    todtls = parsed.get("todtls")
+    if isinstance(todtls, dict):
+        out["issue_date"] = todtls.get("dt") or ""
+    sdtls = parsed.get("sdtls")
+    if isinstance(sdtls, dict):
+        for sub in sdtls.values():
+            if not isinstance(sub, dict):
+                continue
+            if not out["due_date"] and sub.get("duedt"):
+                out["due_date"] = sub.get("duedt") or ""
+            if not out["section"] and sub.get("sec"):
+                out["section"] = sub.get("sec") or ""
+    return out
+
+
 def upload_file_to_s3(file_content, s3_key, content_type="application/octet-stream"):
     """Upload bytes to S3. Returns the key on success, None on failure."""
     try:
@@ -807,18 +838,20 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                                 item_type = (_loads(ij, {}) or {}).get("type") or ""
                             except Exception:
                                 item_type = ""
+                            # Notice-level dates + section from the itemJson.
+                            dates = _parse_item_dates(ij)
                             for d in _parse_doc_descriptors(ij):
                                 if d.get("id") and d.get("docName"):
                                     dtype = _doc_type_label(d.get("ty"), fname, item_type)
-                                    flat.append((fname, grp, d, dtype))
+                                    flat.append((fname, grp, d, dtype, dates))
             if flat:
-                ids = list({str(d["id"]) for _, _, d, _ in flat})
+                ids = list({str(d["id"]) for _, _, d, _, _ in flat})
                 s3_, b3 = _post(s, f"{SERVICES}/litserv/auth/api/usr/getEncrypDocIds",
                                 {"arn": arn, "docIdList": ids})
                 enc = _loads(b3, {}) if s3_ == 200 else {}
 
                 def fetch_one(item):
-                    fname, grp, d, dtype = item
+                    fname, grp, d, dtype, dates = item
                     eh = enc.get(str(d.get("id")))
                     if not eh:
                         return None
@@ -829,13 +862,13 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                         return None
                     att = _upload(data2, org_id, client_name, ref,
                                   d.get("docName") or str(d["id"]), mime2)
-                    return (fname, grp, d, dtype, att) if att else None
+                    return (fname, grp, d, dtype, att, dates) if att else None
 
                 with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
                     for res in ex.map(fetch_one, flat):
                         if not res:
                             continue
-                        fname, grp, d, dtype, att = res
+                        fname, grp, d, dtype, att, dates = res
                         # `type` keeps the folder name (back-compat); `document_type`
                         # is the portal's human "Type of Documents" label.
                         item = {"type": fname,
@@ -844,10 +877,16 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                         nm = d.get("docName")
                         if grp == "replies":
                             item["arn"] = nm
+                            item["reply_date"] = _clean_date(dates.get("issue_date"))
                         elif grp == "orders":
                             item["order_number"] = nm
+                            item["order_date"] = _clean_date(dates.get("issue_date"))
                         else:
                             item["reference_number"] = nm
+                            # Notice-level dates from the itemJson.
+                            item["issue_date"] = _clean_date(dates.get("issue_date"))
+                            item["due_date"] = _clean_date(dates.get("due_date"))
+                            item["section"] = dates.get("section") or ""
                         groups[grp].append(item)
                         files += 1
         return {"kind": "additional", "files": files, "fails": [], "row": {
