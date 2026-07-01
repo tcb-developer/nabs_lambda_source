@@ -41,6 +41,7 @@ lambda_client = boto3.client(
 GST_LAMBDA_FUNCTION_NAME = "fetch_gst_notices_fastapi_lambda"          # selenium (default)
 GST_API_LAMBDA_FUNCTION_NAME = "fetch_gst_notices_api_lambda"          # api
 INCOME_TAX_LAMBDA_FUNCTION_NAME = "fetch_income_tax_notices_fastapi_lambda"  # FastAPI-only duplicate (speed fixes); og_app keeps the shared fetch_income_tax_notices_lambda via its own orchestrator
+TDS_LAMBDA_FUNCTION_NAME = "fetch_tds_notices_fastapi_lambda_hybrid"   # hybrid: new-portal API login + preauthV2 bridge + old-portal headless Selenium scrape (+ JR)
 
 
 def _gst_lambda_for(method):
@@ -204,6 +205,10 @@ def process_income_tax_client(client):
         payload['income_tax_file_download_concurrency'] = client.get(
             'income_tax_file_download_concurrency'
         )
+    # Forward S3 credentials/config (from System Configuration) so the worker
+    # uploads with the configured keys instead of any hardcoded value.
+    if client.get('s3_config'):
+        payload['s3_config'] = client.get('s3_config')
 
     client_info = {
         'client_name': client.get('client_name'),
@@ -275,6 +280,11 @@ def process_gst_client(client):
     if client.get('existing_phase1_ref_ids') is not None:
         payload['existing_phase1_ref_ids'] = client.get('existing_phase1_ref_ids')
 
+    # Forward S3 credentials/config (from System Configuration) so the worker
+    # uploads with the configured keys instead of any hardcoded value.
+    if client.get('s3_config'):
+        payload['s3_config'] = client.get('s3_config')
+
     client_info = {
         'client_name': client.get('client_name'),
         'portal': 'gst',
@@ -307,6 +317,53 @@ def process_gst_client_with_delay(client, delay_seconds):
     return process_gst_client(client)
 
 
+def process_tds_client(client):
+    """
+    Process a single TDS client — invoke the TDS hybrid worker lambda.
+
+    The TDS worker logs in against the new portal's JSON API (needs the TAN +
+    tds username + password), bridges into the old portal, and scrapes the
+    demand/quarter notices (+ optional Justification Report). It returns its
+    result via the same worker webhook GST/IT use.
+
+    Args:
+        client: Dict with keys - client_name, tan, username, password,
+                webhook_config (+ optional with_jr, organization_id, s3_config).
+    """
+    payload = {
+        'client_name': client.get('client_name'),
+        'tan': client.get('tan'),
+        'username': client.get('username'),
+        'password': client.get('password'),
+        'webhook_config': client.get('webhook_config'),
+    }
+    # JR is in scope by default; the backend can turn it off per-run.
+    if client.get('with_jr') is not None:
+        payload['with_jr'] = client.get('with_jr')
+    if client.get('organization_id'):
+        payload['organization_id'] = client.get('organization_id')
+    # S3 config so the worker (if it uploads the JR zip directly) uses the
+    # configured keys; harmless when the backend handles the upload instead.
+    if client.get('s3_config'):
+        payload['s3_config'] = client.get('s3_config')
+
+    client_info = {
+        'client_name': client.get('client_name'),
+        'portal': 'tds',
+        'username': client.get('username'),
+    }
+    return invoke_lambda_async(TDS_LAMBDA_FUNCTION_NAME, payload, client_info)
+
+
+def process_tds_client_with_delay(client, delay_seconds):
+    """Process a single TDS client after an initial delay (batch stagger)."""
+    if delay_seconds > 0:
+        logger.info(f"TDS client {client.get('client_name')}: waiting {delay_seconds}s before starting")
+        time.sleep(delay_seconds)
+    logger.info(f"TDS client {client.get('client_name')}: starting Lambda invocation now")
+    return process_tds_client(client)
+
+
 def _process_batch(batch_clients, batch_number, total_batches, results, enable_fallback, inter_client_delay):
     """
     Process a single batch of clients sequentially within the batch,
@@ -333,6 +390,8 @@ def _process_batch(batch_clients, batch_number, total_batches, results, enable_f
 
             if portal_type == 'income_tax':
                 results['income_tax_results'].append(result)
+            elif portal_type == 'tds':
+                results.setdefault('tds_results', []).append(result)
             else:
                 results['gst_results'].append(result)
 
@@ -365,6 +424,8 @@ def _process_batch(batch_clients, batch_number, total_batches, results, enable_f
 
             if portal_type == 'income_tax':
                 results['income_tax_results'].append(error_result)
+            elif portal_type == 'tds':
+                results.setdefault('tds_results', []).append(error_result)
             else:
                 results['gst_results'].append(error_result)
 
@@ -425,6 +486,7 @@ def lambda_handler(event, context):
         # Extract client lists from event
         income_tax_clients = event.get('income_tax_clients', [])
         gst_clients = event.get('gst_clients', [])
+        tds_clients = event.get('tds_clients', [])
 
         # Batch size controls how many clients are processed at once
         # Should be <= Lambda concurrency limit to avoid throttling
@@ -434,6 +496,7 @@ def lambda_handler(event, context):
         # Delay between clients within a batch (to avoid portal rate limiting)
         income_tax_delay = float(event.get('income_tax_delay_seconds', 2))
         gst_delay = float(event.get('gst_delay_seconds', 3))
+        tds_delay = float(event.get('tds_delay_seconds', 3))
 
         # Delay between batches (to let previous batch fully complete)
         inter_batch_delay = float(event.get('inter_batch_delay_seconds', 5))
@@ -459,17 +522,20 @@ def lambda_handler(event, context):
         results = {
             'income_tax_results': [],
             'gst_results': [],
+            'tds_results': [],
             'failed_clients': [],
             'summary': {
-                'total_clients': len(income_tax_clients) + len(gst_clients),
+                'total_clients': len(income_tax_clients) + len(gst_clients) + len(tds_clients),
                 'income_tax_clients_count': len(income_tax_clients),
                 'gst_clients_count': len(gst_clients),
+                'tds_clients_count': len(tds_clients),
                 'successful': 0,
                 'failed': 0,
                 'execution_time_seconds': 0,
                 'batch_size': batch_size,
                 'income_tax_delay_seconds': income_tax_delay,
-                'gst_delay_seconds': gst_delay
+                'gst_delay_seconds': gst_delay,
+                'tds_delay_seconds': tds_delay
             }
         }
 
@@ -488,16 +554,29 @@ def lambda_handler(event, context):
         # already on the client dict wins (lets a single client be forced).
         gst_fetch_method = (event.get('gst_fetch_method') or 'selenium').lower()
 
+        # S3 credentials/config from FastAPI's System Configuration. Forwarded
+        # to every worker so it uploads with the configured keys (never
+        # hardcoded); absent → the worker falls back to its execution role.
+        s3_config = event.get('s3_config')
+
         # Inject webhook_config into each client so workers can callback directly
         for client in income_tax_clients:
             client['webhook_config'] = webhook_config
             if it_file_dl_conc:
                 client['income_tax_file_download_concurrency'] = it_file_dl_conc
+            if s3_config:
+                client['s3_config'] = s3_config
         for client in gst_clients:
             client['webhook_config'] = webhook_config
             if gst_file_dl_conc:
                 client['gst_file_download_concurrency'] = gst_file_dl_conc
             client.setdefault('gst_fetch_method', gst_fetch_method)
+            if s3_config:
+                client['s3_config'] = s3_config
+        for client in tds_clients:
+            client['webhook_config'] = webhook_config
+            if s3_config:
+                client['s3_config'] = s3_config
 
         # Build a unified list of all clients with their processing functions and delays
         all_clients = []
@@ -505,6 +584,8 @@ def lambda_handler(event, context):
             all_clients.append(('income_tax', client, process_income_tax_client, income_tax_delay))
         for client in gst_clients:
             all_clients.append(('gst', client, process_gst_client, gst_delay))
+        for client in tds_clients:
+            all_clients.append(('tds', client, process_tds_client, tds_delay))
 
         # Split into batches
         batches = []
