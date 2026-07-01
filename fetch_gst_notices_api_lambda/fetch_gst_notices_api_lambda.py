@@ -448,25 +448,37 @@ def _login_once(username, password):
     return None, "transient"
 
 
+# Plain-English Failed-Login reasons (shown to non-technical users).
+LOGIN_FAIL_BAD_CREDENTIALS = (
+    "The GST portal rejected the username or password. Please check and update "
+    "this client's GST login credentials."
+)
+LOGIN_FAIL_TRANSIENT = (
+    "Could not reach the GST portal after multiple attempts. Please try again "
+    "shortly."
+)
+
+
 def _login(username, password):
     """Login with bounded retry. A captcha miss / portal blip is retried with a
     fresh captcha each attempt; a clear wrong-credential rejection fails fast.
-    Returns an authed Session (with `_at` stashed) or None."""
+    Returns ``(session, None)`` on success or ``(None, reason)`` with a
+    plain-English reason for the Failed Login log."""
     for attempt in range(1, _LOGIN_ATTEMPTS + 1):
         s, reason = _login_once(username, password)
         if s is not None:
             if attempt > 1:
                 logger.warning("GST login: succeeded on attempt %d", attempt)
-            return s
+            return s, None
         if reason == "bad_credentials":
             logger.error("GST login: bad credentials — not retrying")
-            return None
+            return None, LOGIN_FAIL_BAD_CREDENTIALS
         if attempt < _LOGIN_ATTEMPTS:
             logger.warning("GST login: transient failure, retrying (%d/%d)",
                            attempt, _LOGIN_ATTEMPTS)
             time.sleep(_LOGIN_BACKOFF * attempt)
     logger.error("GST login: all %d attempts failed (transient)", _LOGIN_ATTEMPTS)
-    return None
+    return None, LOGIN_FAIL_TRANSIENT
 
 
 def _looks_like_json(text):
@@ -631,9 +643,12 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
         return {"success": False, "error": "organization_id missing in event",
                 "response": {}, "stats": stats}
 
-    s = _login(username, password)
+    s, login_err = _login(username, password)
     if not s:
-        return {"success": False, "error": "GST requests-login failed",
+        # Plain-English reason (bad credentials vs transient) for the Failed
+        # Login log so non-technical users understand what to do.
+        return {"success": False,
+                "error": login_err or LOGIN_FAIL_TRANSIENT,
                 "response": {}, "stats": stats}
 
     # Phase 0 — list APIs. _loads is safe: an empty/non-JSON 200 (portal
