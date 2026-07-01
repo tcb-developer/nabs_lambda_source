@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -59,6 +60,54 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
 SERVICES = "https://services.gst.gov.in"
 RETURN = "https://return.gst.gov.in"
+
+# Portal session keep-alive — refreshes the authed session during a long fetch
+# so it doesn't expire mid-run. (Self-contained copy of the backend's
+# app/features/gst_keepalive.py — this is a separate codebase and cannot import
+# app.*; keep the two in sync.)
+KEEPALIVE_URL = f"{SERVICES}/litserv/auth/api/keepalive"
+KEEPALIVE_INTERVAL_SECONDS = 60
+
+
+class _KeepAliveThread:
+    """Background daemon pinging the portal keep-alive on a requests.Session.
+
+    The session is thread-safe for concurrent GETs, so a background thread can
+    keep it warm while the row pool downloads. Best-effort: a failed ping is
+    swallowed, never raised.
+    """
+
+    def __init__(self, session, interval=KEEPALIVE_INTERVAL_SECONDS):
+        self._session = session
+        self._interval = max(5, int(interval or KEEPALIVE_INTERVAL_SECONDS))
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _ping_once(self):
+        try:
+            r = self._session.get(
+                KEEPALIVE_URL, timeout=15,
+                headers={"Accept": "application/json, text/plain, */*"})
+            logger.info("GST keep-alive ping -> HTTP %s", r.status_code)
+        except Exception as e:
+            logger.info("GST keep-alive ping failed (ignored): %s", e)
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            self._ping_once()
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="gst-keepalive", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
 
 # S3 root for the direct-API GST fetcher (MUST match the in-app engine + FE):
 #   FAPI_GST_API_Notices/<organization_id>/<client_id>/<notice_id>/<file>
@@ -835,16 +884,23 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
     results = []
     phase_t0 = time.monotonic()
     files_count = 0
-    with ThreadPoolExecutor(max_workers=row_workers) as ex:
-        futures = [ex.submit(_timed, fn, row) for fn, row in tasks]
-        for fut in as_completed(futures):
-            try:
-                r = fut.result()
-                if r is not None:
-                    results.append(r)
-                    files_count += r.get("files", 0)
-            except Exception as e:
-                stats["failures"].append(f"row task error: {e}")
+    # Keep the portal session warm for the duration of the download pool so it
+    # doesn't expire mid-fetch (background thread pings the keep-alive endpoint).
+    _keepalive = _KeepAliveThread(s)
+    _keepalive.start()
+    try:
+        with ThreadPoolExecutor(max_workers=row_workers) as ex:
+            futures = [ex.submit(_timed, fn, row) for fn, row in tasks]
+            for fut in as_completed(futures):
+                try:
+                    r = fut.result()
+                    if r is not None:
+                        results.append(r)
+                        files_count += r.get("files", 0)
+                except Exception as e:
+                    stats["failures"].append(f"row task error: {e}")
+    finally:
+        _keepalive.stop()
     stats["fetch_seconds"] = round(time.monotonic() - phase_t0, 2)
 
     per_notice = []
