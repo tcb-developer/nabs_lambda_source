@@ -816,7 +816,10 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
         if cid and arn and ctype and gid:
             st_, body_ = _post(s, f"{SERVICES}/litserv/auth/api/case/folder",
                                {"caseId": cid, "gstid": gid, "caseTypeCd": ctype})
-            flat = []
+            # ONE entry per PORTAL ITEM (itemJson) — NOT per attachment — so a
+            # multi-attachment row stays one row (refId reference) and a
+            # zero-attachment item (e.g. an ADJOURNMENT) is still kept.
+            item_list = []
             if st_ == 200:
                 for f in _loads(body_, []):
                     fname = f.get("caseFolderTypeName", "?")
@@ -830,28 +833,41 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                         continue
                     for it in _loads(b2, []):
                         ij = it.get("itemJson", "")
-                        if isinstance(ij, str) and ij:
-                            # itemJson sometimes carries a ready human doc-type
-                            # in its top-level "type" (e.g. "Issue Acknowledgement").
+                        if not (isinstance(ij, str) and ij):
+                            continue
+                        # itemJson sometimes carries a ready human doc-type
+                        # in its top-level "type" (e.g. "Issue Acknowledgement").
+                        item_type = ""
+                        try:
+                            item_type = (_loads(ij, {}) or {}).get("type") or ""
+                        except Exception:
                             item_type = ""
-                            try:
-                                item_type = (_loads(ij, {}) or {}).get("type") or ""
-                            except Exception:
-                                item_type = ""
-                            # Notice-level dates + section from the itemJson.
-                            dates = _parse_item_dates(ij)
-                            for d in _parse_doc_descriptors(ij):
-                                if d.get("id") and d.get("docName"):
-                                    dtype = _doc_type_label(d.get("ty"), fname, item_type)
-                                    flat.append((fname, grp, d, dtype, dates))
-            if flat:
-                ids = list({str(d["id"]) for _, _, d, _, _ in flat})
-                s3_, b3 = _post(s, f"{SERVICES}/litserv/auth/api/usr/getEncrypDocIds",
-                                {"arn": arn, "docIdList": ids})
-                enc = _loads(b3, {}) if s3_ == 200 else {}
+                        # Notice-level dates + section from the itemJson.
+                        dates = _parse_item_dates(ij)
+                        # Reference is the ITEM's refId — NOT an attachment name.
+                        ref_no = it.get("refId") or ""
+                        descriptors = [
+                            d for d in _parse_doc_descriptors(ij)
+                            if d.get("id") and d.get("docName")
+                        ]
+                        first_ty = descriptors[0].get("ty") if descriptors else None
+                        item_list.append({
+                            "fname": fname, "grp": grp, "ref_no": ref_no,
+                            "dtype": _doc_type_label(first_ty, fname, item_type),
+                            "dates": dates, "descriptors": descriptors,
+                        })
 
-                def fetch_one(item):
-                    fname, grp, d, dtype, dates = item
+            if item_list:
+                ids = list({
+                    str(d["id"]) for itm in item_list for d in itm["descriptors"]
+                })
+                enc = {}
+                if ids:
+                    s3_, b3 = _post(s, f"{SERVICES}/litserv/auth/api/usr/getEncrypDocIds",
+                                    {"arn": arn, "docIdList": ids})
+                    enc = _loads(b3, {}) if s3_ == 200 else {}
+
+                def fetch_desc(d):
                     eh = enc.get(str(d.get("id")))
                     if not eh:
                         return None
@@ -860,35 +876,41 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                     ext = _doc_ext(data2, mime2, d.get("docName") or "")
                     if not (st2_ == 200 and data2 and ext is not None):
                         return None
-                    att = _upload(data2, org_id, client_name, ref,
-                                  d.get("docName") or str(d["id"]), mime2)
-                    return (fname, grp, d, dtype, att, dates) if att else None
+                    return _upload(data2, org_id, client_name, ref,
+                                   d.get("docName") or str(d["id"]), mime2)
 
-                with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
-                    for res in ex.map(fetch_one, flat):
-                        if not res:
-                            continue
-                        fname, grp, d, dtype, att, dates = res
-                        # `type` keeps the folder name (back-compat); `document_type`
-                        # is the portal's human "Type of Documents" label.
-                        item = {"type": fname,
-                                "document_type": dtype,
-                                "attachments": [att]}
-                        nm = d.get("docName")
-                        if grp == "replies":
-                            item["arn"] = nm
-                            item["reply_date"] = _clean_date(dates.get("issue_date"))
-                        elif grp == "orders":
-                            item["order_number"] = nm
-                            item["order_date"] = _clean_date(dates.get("issue_date"))
-                        else:
-                            item["reference_number"] = nm
-                            # Notice-level dates from the itemJson.
-                            item["issue_date"] = _clean_date(dates.get("issue_date"))
-                            item["due_date"] = _clean_date(dates.get("due_date"))
-                            item["section"] = dates.get("section") or ""
-                        groups[grp].append(item)
-                        files += 1
+                all_descs = [d for itm in item_list for d in itm["descriptors"]]
+                dl = {}
+                if all_descs:
+                    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+                        for d, att in zip(all_descs, ex.map(fetch_desc, all_descs)):
+                            if att:
+                                dl[str(d["id"])] = att
+
+                # Emit ONE group entry per portal item (even with zero attachments).
+                for itm in item_list:
+                    grp, dates = itm["grp"], itm["dates"]
+                    atts = [dl[str(d["id"])] for d in itm["descriptors"]
+                            if str(d["id"]) in dl]
+                    files += len(atts)
+                    # `type` keeps the folder name (back-compat); `document_type`
+                    # is the portal's human "Type of Documents" label.
+                    item = {"type": itm["fname"],
+                            "document_type": itm["dtype"],
+                            "attachments": atts}
+                    if grp == "replies":
+                        item["arn"] = itm["ref_no"]
+                        item["reply_date"] = _clean_date(dates.get("issue_date"))
+                    elif grp == "orders":
+                        item["order_number"] = itm["ref_no"]
+                        item["order_date"] = _clean_date(dates.get("issue_date"))
+                    else:
+                        item["reference_number"] = itm["ref_no"]
+                        # Notice-level dates from the itemJson.
+                        item["issue_date"] = _clean_date(dates.get("issue_date"))
+                        item["due_date"] = _clean_date(dates.get("due_date"))
+                        item["section"] = dates.get("section") or ""
+                    groups[grp].append(item)
         return {"kind": "additional", "files": files, "fails": [], "row": {
             "ref_id": ref, "arn": arn, "type": row.get("caseTypeName") or ctype,
             "issue_date": _clean_date(
