@@ -317,7 +317,7 @@ def _parse_item_dates(item_json_str):
     save timestamps, NOT the notice dates. Returns DD/MM/YYYY strings ("" when
     absent); the caller cleans via _clean_date.
     """
-    out = {"issue_date": "", "due_date": "", "section": ""}
+    out = {"issue_date": "", "due_date": "", "section": "", "type": ""}
     try:
         parsed = json.loads(item_json_str)
     except Exception:
@@ -336,6 +336,8 @@ def _parse_item_dates(item_json_str):
                 out["due_date"] = sub.get("duedt") or ""
             if not out["section"] and sub.get("sec"):
                 out["section"] = sub.get("sec") or ""
+            if not out["type"] and sub.get("type"):
+                out["type"] = sub.get("type") or ""
     return out
 
 
@@ -893,9 +895,11 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                     atts = [dl[str(d["id"])] for d in itm["descriptors"]
                             if str(d["id"]) in dl]
                     files += len(atts)
-                    # `type` keeps the folder name (back-compat); `document_type`
-                    # is the portal's human "Type of Documents" label.
-                    item = {"type": itm["fname"],
+                    # `type` = the portal's per-item type (e.g. NOTICE /
+                    # ADJOURNMENT from sdtls.*.type), falling back to the folder
+                    # name only when absent. `document_type` is the portal's
+                    # human "Type of Documents" label.
+                    item = {"type": dates.get("type") or itm["fname"],
                             "document_type": itm["dtype"],
                             "attachments": atts}
                     if grp == "replies":
