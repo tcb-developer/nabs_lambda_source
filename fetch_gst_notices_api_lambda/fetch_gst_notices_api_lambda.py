@@ -84,20 +84,41 @@ _LOGIN_BACKOFF = 1.5  # seconds, ×attempt
 _s3_client = None
 
 
+# Per-invocation S3 config from the event payload (s3_config), sourced from
+# FastAPI System Configuration. configure_s3() applies it before any upload.
+_S3_CONFIG = {}
+
+
+def configure_s3(s3_config):
+    """Apply event-provided S3 config (keys/region/bucket) from System
+    Configuration. Resets the cached client. No-op if empty."""
+    global _S3_CONFIG, _s3_client, S3_BUCKET, AWS_REGION
+    if not s3_config:
+        return
+    _S3_CONFIG = dict(s3_config)
+    if _S3_CONFIG.get("region"):
+        AWS_REGION = _S3_CONFIG["region"]
+    if _S3_CONFIG.get("bucket"):
+        S3_BUCKET = _S3_CONFIG["bucket"]
+    _s3_client = None
+
+
 def _get_s3_client():
     """Shared S3 client.
 
-    Credentials resolve from boto3's default chain — on Lambda that is the
-    execution role's temporary creds (access key + secret + SESSION TOKEN).
+    Credential precedence (never hardcoded):
+      1. event s3_config (System Configuration, via configure_s3) — these are
+         permanent IAM-user keys (access + secret, no session token), valid to
+         hand to boto3 directly.
+      2. GST_S3_ACCESS_KEY / GST_S3_SECRET_KEY env vars (explicit local override).
+      3. boto3 default chain — on Lambda the execution role's temporary creds.
     We must NOT hand-pick AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY from the env
-    while dropping AWS_SESSION_TOKEN — that yields an invalid credential and
-    every PutObject fails. For an explicit non-role override (e.g. local runs)
-    use GST_S3_ACCESS_KEY/GST_S3_SECRET_KEY (non-reserved names)."""
+    while dropping AWS_SESSION_TOKEN — that yields an invalid credential."""
     global _s3_client
     if _s3_client is None:
         kwargs = {"region_name": AWS_REGION, "config": Config(signature_version="s3v4")}
-        ak = os.environ.get("GST_S3_ACCESS_KEY")
-        sk = os.environ.get("GST_S3_SECRET_KEY")
+        ak = _S3_CONFIG.get("aws_access_key_id") or os.environ.get("GST_S3_ACCESS_KEY")
+        sk = _S3_CONFIG.get("aws_secret_access_key") or os.environ.get("GST_S3_SECRET_KEY")
         if ak and sk:
             kwargs["aws_access_key_id"] = ak
             kwargs["aws_secret_access_key"] = sk
@@ -595,11 +616,58 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
             "stats": stats,
         }
 
-    folder_to_group = {
+    # Folder → group classification. The GST portal decides a folder's real
+    # category from the case-type + folder CODE (its caseconfig.json), NOT the
+    # folder's display name — e.g. for a DRC-03 Voluntary-Payment case
+    # (caseTypeCd "ADJVP") the "ORDRS" folder renders orderVp.html, which is an
+    # ACKNOWLEDGEMENT, not a normal order. Classifying purely on the folder NAME
+    # ("ORDERS" → orders) mis-filed those acks under Orders. So classify on the
+    # folder CODE, with the case-type-specific overrides the portal itself uses.
+    _FOLDER_CODE_TO_GROUP = {
+        "NOTCE": "notices", "NOTAC": "notices",
+        "REPLY": "replies",
+        "ORDRS": "orders",
+        "INTIM": "intimations", "INORD": "intimations",
+        "APLCN": "applications",
+        "ACKIN": "ack_intimations",
+    }
+    _FOLDER_OVERRIDE = {
+        ("ADJVP", "ORDRS"): "ack_intimations",
+    }
+    _FOLDER_NAME_TO_GROUP = {
         "NOTICES": "notices", "REPLIES": "replies", "ORDERS": "orders",
         "INTIMATIONS": "intimations", "APPLICATIONS": "applications",
-        "ACK./INTIMATION": "ack_intimations",
+        "ACK./INTIMATION": "ack_intimations", "ACK/INTIMATION": "ack_intimations",
     }
+
+    def _classify_folder(case_type_cd, folder_code, folder_name):
+        """Map a case folder to our group using the portal's own logic:
+        case-type override first, then folder CODE, then folder NAME."""
+        fc = (folder_code or "").strip().upper()
+        ct = (case_type_cd or "").strip().upper()
+        if (ct, fc) in _FOLDER_OVERRIDE:
+            return _FOLDER_OVERRIDE[(ct, fc)]
+        if fc in _FOLDER_CODE_TO_GROUP:
+            return _FOLDER_CODE_TO_GROUP[fc]
+        return _FOLDER_NAME_TO_GROUP.get((folder_name or "").strip().upper(), "notices")
+
+    # A document descriptor (dcupdtls) carries a type CODE in `ty`. The portal
+    # UI renders a human "Type of Documents" label from it (adjudicationctrl.js),
+    # e.g. ty "REGC" → "Intimation Of Voluntary Payment DRC-03". Port the known
+    # codes; unknown codes fall back to the folder name so Type is never blank.
+    _DOC_TY_TO_LABEL = {
+        "REGC": "Intimation Of Voluntary Payment DRC-03",
+    }
+
+    def _doc_type_label(ty, folder_name, item_type=""):
+        """Prefer the itemJson's own `type` text (e.g. "Issue Acknowledgement"),
+        then a mapped `ty` code, then the folder name as a last resort."""
+        if item_type and str(item_type).strip():
+            return str(item_type).strip()
+        t = (ty or "").strip().upper()
+        if t in _DOC_TY_TO_LABEL:
+            return _DOC_TY_TO_LABEL[t]
+        return (folder_name or "").strip() or (ty or "")
 
     def _do_normal(row):
         oid = row.get("noticeOrderId") or "x"
@@ -672,6 +740,10 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
             if st_ == 200:
                 for f in _loads(body_, []):
                     fname = f.get("caseFolderTypeName", "?")
+                    fcode = f.get("caseFolderTypeCd", "")
+                    # Classify the folder ONCE (case-type + folder code aware) so
+                    # e.g. an ADJVP "ORDRS" ack lands in ack_intimations, not orders.
+                    grp = _classify_folder(ctype, fcode, fname)
                     s2, b2 = _post(s, f"{SERVICES}/litserv/auth/api/case/folder/items",
                                    {"caseFolderId": f.get("caseFolderId")})
                     if s2 != 200:
@@ -679,17 +751,25 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                     for it in _loads(b2, []):
                         ij = it.get("itemJson", "")
                         if isinstance(ij, str) and ij:
+                            # itemJson sometimes carries a ready human doc-type
+                            # in its top-level "type" (e.g. "Issue Acknowledgement").
+                            item_type = ""
+                            try:
+                                item_type = (_loads(ij, {}) or {}).get("type") or ""
+                            except Exception:
+                                item_type = ""
                             for d in _parse_doc_descriptors(ij):
                                 if d.get("id") and d.get("docName"):
-                                    flat.append((fname, d))
+                                    dtype = _doc_type_label(d.get("ty"), fname, item_type)
+                                    flat.append((fname, grp, d, dtype))
             if flat:
-                ids = list({str(d["id"]) for _, d in flat})
+                ids = list({str(d["id"]) for _, _, d, _ in flat})
                 s3_, b3 = _post(s, f"{SERVICES}/litserv/auth/api/usr/getEncrypDocIds",
                                 {"arn": arn, "docIdList": ids})
                 enc = _loads(b3, {}) if s3_ == 200 else {}
 
                 def fetch_one(item):
-                    fname, d = item
+                    fname, grp, d, dtype = item
                     eh = enc.get(str(d.get("id")))
                     if not eh:
                         return None
@@ -700,15 +780,18 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                         return None
                     att = _upload(data2, org_id, client_name, ref,
                                   d.get("docName") or str(d["id"]), mime2)
-                    return (fname, d, att) if att else None
+                    return (fname, grp, d, dtype, att) if att else None
 
                 with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
                     for res in ex.map(fetch_one, flat):
                         if not res:
                             continue
-                        fname, d, att = res
-                        grp = folder_to_group.get(fname, "notices")
-                        item = {"type": fname, "attachments": [att]}
+                        fname, grp, d, dtype, att = res
+                        # `type` keeps the folder name (back-compat); `document_type`
+                        # is the portal's human "Type of Documents" label.
+                        item = {"type": fname,
+                                "document_type": dtype,
+                                "attachments": [att]}
                         nm = d.get("docName")
                         if grp == "replies":
                             item["arn"] = nm
@@ -860,6 +943,10 @@ def lambda_handler(event, context):
     """
     handler_start_time = time.time()
     try:
+        # Apply S3 credentials/config from the event (System Configuration)
+        # before any upload.
+        configure_s3(event.get("s3_config"))
+
         username = event.get("username")
         password = event.get("password")
         client_name = event.get("client_name")
