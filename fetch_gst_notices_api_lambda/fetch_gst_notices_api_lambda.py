@@ -317,7 +317,8 @@ def _parse_item_dates(item_json_str):
     save timestamps, NOT the notice dates. Returns DD/MM/YYYY strings ("" when
     absent); the caller cleans via _clean_date.
     """
-    out = {"issue_date": "", "due_date": "", "section": "", "type": ""}
+    out = {"issue_date": "", "due_date": "", "section": "", "type": "",
+           "reply_date": "", "reply_filed_against": "", "personal_hearing": ""}
     try:
         parsed = json.loads(item_json_str)
     except Exception:
@@ -338,6 +339,17 @@ def _parse_item_dates(item_json_str):
                 out["section"] = sub.get("sec") or ""
             if not out["type"] and sub.get("type"):
                 out["type"] = sub.get("type") or ""
+    # Reply items — fields under a `reply` wrapper (replyty / ntcno / pershrng /
+    # decdtls.dt). Keep in sync with the backend helper.
+    reply = parsed.get("reply")
+    if isinstance(reply, dict):
+        if not out["type"]:
+            out["type"] = reply.get("replyty") or ""
+        out["reply_filed_against"] = reply.get("ntcno") or ""
+        out["personal_hearing"] = reply.get("pershrng") or ""
+        decdtls = reply.get("decdtls")
+        if isinstance(decdtls, dict):
+            out["reply_date"] = decdtls.get("dt") or ""
     return out
 
 
@@ -919,7 +931,9 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                             "attachments": atts}
                     if grp == "replies":
                         item["arn"] = itm["ref_no"]
-                        item["reply_date"] = _clean_date(dates.get("issue_date"))
+                        item["reply_date"] = _clean_date(dates.get("reply_date"))
+                        item["reply_filed_against"] = dates.get("reply_filed_against") or ""
+                        item["personal_hearing"] = dates.get("personal_hearing") or ""
                     elif grp == "orders":
                         item["order_number"] = itm["ref_no"]
                         item["order_date"] = _clean_date(dates.get("issue_date"))
