@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -59,6 +60,54 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
 SERVICES = "https://services.gst.gov.in"
 RETURN = "https://return.gst.gov.in"
+
+# Portal session keep-alive — refreshes the authed session during a long fetch
+# so it doesn't expire mid-run. (Self-contained copy of the backend's
+# app/features/gst_keepalive.py — this is a separate codebase and cannot import
+# app.*; keep the two in sync.)
+KEEPALIVE_URL = f"{SERVICES}/litserv/auth/api/keepalive"
+KEEPALIVE_INTERVAL_SECONDS = 60
+
+
+class _KeepAliveThread:
+    """Background daemon pinging the portal keep-alive on a requests.Session.
+
+    The session is thread-safe for concurrent GETs, so a background thread can
+    keep it warm while the row pool downloads. Best-effort: a failed ping is
+    swallowed, never raised.
+    """
+
+    def __init__(self, session, interval=KEEPALIVE_INTERVAL_SECONDS):
+        self._session = session
+        self._interval = max(5, int(interval or KEEPALIVE_INTERVAL_SECONDS))
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _ping_once(self):
+        try:
+            r = self._session.get(
+                KEEPALIVE_URL, timeout=15,
+                headers={"Accept": "application/json, text/plain, */*"})
+            logger.info("GST keep-alive ping -> HTTP %s", r.status_code)
+        except Exception as e:
+            logger.info("GST keep-alive ping failed (ignored): %s", e)
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            self._ping_once()
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="gst-keepalive", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
 
 # S3 root for the direct-API GST fetcher (MUST match the in-app engine + FE):
 #   FAPI_GST_API_Notices/<organization_id>/<client_id>/<notice_id>/<file>
@@ -84,20 +133,60 @@ _LOGIN_BACKOFF = 1.5  # seconds, ×attempt
 _s3_client = None
 
 
+# Per-invocation S3 config from the event payload (s3_config), sourced from
+# FastAPI System Configuration. configure_s3() applies it before any upload.
+_S3_CONFIG = {}
+
+# Thread-safe accumulator for TOTAL S3-upload time this invocation (files are
+# uploaded from a ThreadPoolExecutor, so the counter needs a lock). Reset at the
+# start of each fetch (process_gst_notices), reported as stats.s3_upload_seconds
+# so the timing page can split "portal fetch" vs "S3 upload" inside fetch_seconds.
+_s3_upload_lock = threading.Lock()
+_s3_upload_seconds = 0.0
+
+
+def _reset_s3_upload_timer():
+    global _s3_upload_seconds
+    with _s3_upload_lock:
+        _s3_upload_seconds = 0.0
+
+
+def _add_s3_upload_time(seconds):
+    global _s3_upload_seconds
+    with _s3_upload_lock:
+        _s3_upload_seconds += seconds
+
+
+def configure_s3(s3_config):
+    """Apply event-provided S3 config (keys/region/bucket) from System
+    Configuration. Resets the cached client. No-op if empty."""
+    global _S3_CONFIG, _s3_client, S3_BUCKET, AWS_REGION
+    if not s3_config:
+        return
+    _S3_CONFIG = dict(s3_config)
+    if _S3_CONFIG.get("region"):
+        AWS_REGION = _S3_CONFIG["region"]
+    if _S3_CONFIG.get("bucket"):
+        S3_BUCKET = _S3_CONFIG["bucket"]
+    _s3_client = None
+
+
 def _get_s3_client():
     """Shared S3 client.
 
-    Credentials resolve from boto3's default chain — on Lambda that is the
-    execution role's temporary creds (access key + secret + SESSION TOKEN).
+    Credential precedence (never hardcoded):
+      1. event s3_config (System Configuration, via configure_s3) — these are
+         permanent IAM-user keys (access + secret, no session token), valid to
+         hand to boto3 directly.
+      2. GST_S3_ACCESS_KEY / GST_S3_SECRET_KEY env vars (explicit local override).
+      3. boto3 default chain — on Lambda the execution role's temporary creds.
     We must NOT hand-pick AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY from the env
-    while dropping AWS_SESSION_TOKEN — that yields an invalid credential and
-    every PutObject fails. For an explicit non-role override (e.g. local runs)
-    use GST_S3_ACCESS_KEY/GST_S3_SECRET_KEY (non-reserved names)."""
+    while dropping AWS_SESSION_TOKEN — that yields an invalid credential."""
     global _s3_client
     if _s3_client is None:
         kwargs = {"region_name": AWS_REGION, "config": Config(signature_version="s3v4")}
-        ak = os.environ.get("GST_S3_ACCESS_KEY")
-        sk = os.environ.get("GST_S3_SECRET_KEY")
+        ak = _S3_CONFIG.get("aws_access_key_id") or os.environ.get("GST_S3_ACCESS_KEY")
+        sk = _S3_CONFIG.get("aws_secret_access_key") or os.environ.get("GST_S3_SECRET_KEY")
         if ak and sk:
             kwargs["aws_access_key_id"] = ak
             kwargs["aws_secret_access_key"] = sk
@@ -116,15 +205,21 @@ def _safe_name(s):
 
 def _clean_date(date_str):
     """DD/MM/YYYY (or epoch-ms) -> ISO date string. Accepts both because the
-    portal's case/task APIs return some dates as epoch-milliseconds."""
+    portal's case/task APIs return some dates as epoch-milliseconds.
+
+    Epoch-ms values are IST civil moments (the GST portal is IST) and MUST be
+    read as the IST calendar date, NOT UTC — otherwise a midnight-IST stamp
+    (e.g. 12/03/2026 00:00 IST) lands at 11/03 18:30 UTC and the date rolls
+    back a day (the Additional-Notices Issue-Date off-by-one)."""
     if date_str is None:
         return None
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta
+    _IST_TZ = timezone(timedelta(hours=5, minutes=30))
     if isinstance(date_str, (int, float)) and not isinstance(date_str, bool):
         try:
             ms = int(date_str)
             if ms > 0:
-                return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).date().isoformat()
+                return datetime.fromtimestamp(ms / 1000, tz=_IST_TZ).date().isoformat()
         except Exception:
             return None
         return None
@@ -134,7 +229,7 @@ def _clean_date(date_str):
             return None
         if s.isdigit() and len(s) >= 12:
             try:
-                return datetime.fromtimestamp(int(s) / 1000, tz=timezone.utc).date().isoformat()
+                return datetime.fromtimestamp(int(s) / 1000, tz=_IST_TZ).date().isoformat()
             except Exception:
                 pass
         try:
@@ -207,8 +302,46 @@ def _content_type_for(ext):
     }.get(ext, "application/octet-stream")
 
 
+# Portal ORDER type is derived from the 3rd underscore-segment of the item's
+# `caseCfItemMapId` / `act_cd` (e.g. "LETUT_ORDRS_DMAPL" -> "DMAPL"). Mirrors the
+# portal's own lutcasectrl.js. (Kept in sync with the backend engines.)
+_ORDER_TYPE_BY_CODE = {
+    "APCOD": "ACCEPTANCE ORDER",
+    "RJNOD": "REJECTION ORDER",
+    "DMAPL": "DEEMED APPROVAL",
+}
+
+
+def _order_type_from_map_id(map_id):
+    """Human order type from a caseCfItemMapId / act_cd like 'LETUT_ORDRS_DMAPL'
+    -> 'DEEMED APPROVAL'. Returns '' when the code is absent or unrecognised."""
+    if not map_id:
+        return ""
+    parts = str(map_id).split("_")
+    if len(parts) >= 3:
+        return _ORDER_TYPE_BY_CODE.get(parts[2], "")
+    return ""
+
+
+def _order_type_from_item(it, item_json_str):
+    """Resolve an order item's type from its top-level `caseCfItemMapId`, else
+    the itemJson's `act_cd`. Only meaningful for order items."""
+    map_id = (it or {}).get("caseCfItemMapId")
+    if not map_id:
+        try:
+            map_id = (json.loads(item_json_str) or {}).get("act_cd")
+        except Exception:
+            map_id = None
+    return _order_type_from_map_id(map_id)
+
+
 def _parse_doc_descriptors(item_json_str):
-    """Walk an itemJson string for every `dcupdtls` descriptor."""
+    """Walk an itemJson string for every document descriptor.
+
+    Notices/replies list their files under `dcupdtls`; ORDER items (deemed
+    approval / acceptance / rejection) list theirs under `docupdtl` instead —
+    both must be collected, else an order's attachments are silently dropped.
+    """
     try:
         parsed = json.loads(item_json_str)
     except Exception:
@@ -217,17 +350,18 @@ def _parse_doc_descriptors(item_json_str):
 
     def walk(obj):
         if isinstance(obj, dict):
-            if "dcupdtls" in obj:
-                v = obj["dcupdtls"]
-                if isinstance(v, dict):
-                    found.append(v)
-                elif isinstance(v, list):
-                    for item in v:
-                        if isinstance(item, dict):
-                            if "id" in item or "docName" in item:
-                                found.append(item)
-                            else:
-                                walk(item)
+            for _key in ("dcupdtls", "docupdtl"):
+                if _key in obj:
+                    v = obj[_key]
+                    if isinstance(v, dict):
+                        found.append(v)
+                    elif isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, dict):
+                                if "id" in item or "docName" in item:
+                                    found.append(item)
+                                else:
+                                    walk(item)
             for v in obj.values():
                 walk(v)
         elif isinstance(obj, list):
@@ -238,8 +372,65 @@ def _parse_doc_descriptors(item_json_str):
     return found
 
 
+def _parse_item_dates(item_json_str):
+    """Pull notice-level dates + section out of a case-item's itemJson.
+
+    (Self-contained copy of the backend app/features/fetch_gst_notices.py
+    helper — keep in sync.) Issue Date <- todtls.dt; Due Date <- sdtls.*.duedt;
+    Section <- sdtls.*.sec. The row's top-level insertDate/updateDate are only
+    save timestamps, NOT the notice dates. Returns DD/MM/YYYY strings ("" when
+    absent); the caller cleans via _clean_date.
+    """
+    out = {"issue_date": "", "due_date": "", "section": "", "type": "",
+           "reply_date": "", "reply_filed_against": "", "personal_hearing": ""}
+    try:
+        parsed = json.loads(item_json_str)
+    except Exception:
+        return out
+    if not isinstance(parsed, dict):
+        return out
+    # Issue Date = the item's own top-level `refdt` (e.g. "08/08/2025");
+    # todtls.dt does not exist for these items (was leaving Issue Date blank).
+    out["issue_date"] = parsed.get("refdt") or ""
+    if not out["issue_date"]:
+        todtls = parsed.get("todtls")
+        if isinstance(todtls, dict):
+            out["issue_date"] = todtls.get("dt") or ""
+    sdtls = parsed.get("sdtls")
+    if isinstance(sdtls, dict):
+        for sub in sdtls.values():
+            if not isinstance(sub, dict):
+                continue
+            if not out["due_date"] and sub.get("duedt"):
+                out["due_date"] = sub.get("duedt") or ""
+            if not out["section"] and sub.get("sec"):
+                out["section"] = sub.get("sec") or ""
+            if not out["type"] and sub.get("type"):
+                out["type"] = sub.get("type") or ""
+            # Personal Hearing for NOTICE items (sdtls.*.pershrng); replies carry
+            # it under the `reply` wrapper below. Same out-key. Keep in sync with
+            # the backend helper.
+            if not out["personal_hearing"] and sub.get("pershrng"):
+                out["personal_hearing"] = sub.get("pershrng") or ""
+    # Reply items — fields under a `reply` wrapper (replyty / ntcno / pershrng /
+    # decdtls.dt). Keep in sync with the backend helper.
+    reply = parsed.get("reply")
+    if isinstance(reply, dict):
+        if not out["type"]:
+            out["type"] = reply.get("replyty") or ""
+        out["reply_filed_against"] = reply.get("ntcno") or ""
+        out["personal_hearing"] = reply.get("pershrng") or ""
+        decdtls = reply.get("decdtls")
+        if isinstance(decdtls, dict):
+            out["reply_date"] = decdtls.get("dt") or ""
+    return out
+
+
 def upload_file_to_s3(file_content, s3_key, content_type="application/octet-stream"):
-    """Upload bytes to S3. Returns the key on success, None on failure."""
+    """Upload bytes to S3. Returns the key on success, None on failure.
+    Times the PUT into the per-invocation S3-upload accumulator so the timing
+    page can show how much of the fetch was spent uploading files to S3."""
+    _t0 = time.monotonic()
     try:
         client = _get_s3_client()
         client.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=file_content,
@@ -248,6 +439,54 @@ def upload_file_to_s3(file_content, s3_key, content_type="application/octet-stre
     except Exception as e:
         logger.error("Failed to upload S3 key %s: %s", s3_key, str(e))
         return None
+    finally:
+        _add_s3_upload_time(time.monotonic() - _t0)
+
+
+def _ext_pre_download(doc_name, mime):
+    """Best-effort extension from docName suffix -> mime, WITHOUT the bytes, so
+    an attachment's reuse-check key can be built BEFORE downloading. None when
+    neither yields an extension (caller downloads). Mirrors the backend helper."""
+    name_ext = os.path.splitext(doc_name or "")[1].lower()
+    if name_ext:
+        return name_ext
+    m = (mime or "").lower()
+    mime_map = {
+        "application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png",
+        "image/tiff": ".tiff", "application/msword": ".doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/vnd.ms-excel": ".xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    }
+    for k, ext in mime_map.items():
+        if k in m:
+            return ext
+    return None
+
+
+def _att_key(org_id, client_id, ref_id, ext, doc_name):
+    """Deterministic org+client+ref-scoped S3 key for one GST attachment.
+    SINGLE source of truth — used by _upload AND the reuse-check so they match."""
+    stem = os.path.splitext(doc_name)[0] or doc_name or "doc"
+    safe_file_name = _safe_name(stem) + ext
+    return (f"{GST_API_S3_ROOT}/{org_id}/{_safe_name(client_id)}/"
+            f"{_safe_name(ref_id)}/{safe_file_name}")
+
+
+def reuse_existing_attachment(s3_key, display_name=""):
+    """UNIFIED attachment-reuse rule (Lambda copy of the backend helper — keep
+    in sync). Reuse only when the S3 object EXISTS and is NON-EMPTY
+    (ContentLength > 0): missing / zero-byte / truncated / corrupted fails, so
+    the caller re-downloads. Returns {file_url, file_name} to reuse, else None."""
+    if not s3_key:
+        return None
+    try:
+        resp = _get_s3_client().head_object(Bucket=S3_BUCKET, Key=s3_key)
+        if int(resp.get("ContentLength") or 0) > 0:
+            return {"file_url": s3_key, "file_name": (display_name or "").strip()}
+    except Exception:
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -345,25 +584,37 @@ def _login_once(username, password):
     return None, "transient"
 
 
+# Plain-English Failed-Login reasons (shown to non-technical users).
+LOGIN_FAIL_BAD_CREDENTIALS = (
+    "The GST portal rejected the username or password. Please check and update "
+    "this client's GST login credentials."
+)
+LOGIN_FAIL_TRANSIENT = (
+    "Could not reach the GST portal after multiple attempts. Please try again "
+    "shortly."
+)
+
+
 def _login(username, password):
     """Login with bounded retry. A captcha miss / portal blip is retried with a
     fresh captcha each attempt; a clear wrong-credential rejection fails fast.
-    Returns an authed Session (with `_at` stashed) or None."""
+    Returns ``(session, None)`` on success or ``(None, reason)`` with a
+    plain-English reason for the Failed Login log."""
     for attempt in range(1, _LOGIN_ATTEMPTS + 1):
         s, reason = _login_once(username, password)
         if s is not None:
             if attempt > 1:
                 logger.warning("GST login: succeeded on attempt %d", attempt)
-            return s
+            return s, None
         if reason == "bad_credentials":
             logger.error("GST login: bad credentials — not retrying")
-            return None
+            return None, LOGIN_FAIL_BAD_CREDENTIALS
         if attempt < _LOGIN_ATTEMPTS:
             logger.warning("GST login: transient failure, retrying (%d/%d)",
                            attempt, _LOGIN_ATTEMPTS)
             time.sleep(_LOGIN_BACKOFF * attempt)
     logger.error("GST login: all %d attempts failed (transient)", _LOGIN_ATTEMPTS)
-    return None
+    return None, LOGIN_FAIL_TRANSIENT
 
 
 def _looks_like_json(text):
@@ -449,13 +700,17 @@ def _upload(data, org_id, client_id, ref_id, doc_name, mime):
     ext = _doc_ext(data, mime, doc_name)
     if ext is None or not data:
         return None
-    stem = os.path.splitext(doc_name)[0] or doc_name or "doc"
-    file_name = _safe_name(stem) + ext
-    key = (f"{GST_API_S3_ROOT}/{org_id}/{_safe_name(client_id)}/"
-           f"{_safe_name(ref_id)}/{file_name}")
+    # S3 key uses the SANITIZED name (spaces/brackets break object keys); the
+    # display name is the ORIGINAL portal docName so the Attachments column
+    # matches the portal exactly.
+    safe_file_name = _safe_name(os.path.splitext(doc_name)[0] or doc_name or "doc") + ext
+    key = _att_key(org_id, client_id, ref_id, ext, doc_name)
     if not upload_file_to_s3(data, key, _content_type_for(ext)):
         return None
-    return {"file_url": key, "file_name": file_name}
+    display_name = (doc_name or "").strip() or safe_file_name
+    if ext and not os.path.splitext(display_name)[1]:
+        display_name = display_name + ext
+    return {"file_url": key, "file_name": display_name}
 
 
 def _gstin_from(notices, fallback):
@@ -519,6 +774,7 @@ def _resolve_session_gstin(s, notices, username, db_gstin):
 def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                         concurrency=None):
     concurrency = concurrency or _GST_FILE_DOWNLOAD_CONCURRENCY
+    _reset_s3_upload_timer()  # fresh per-invocation S3-upload accumulator
     stats = {"notices": 0, "additional": 0, "gstr3a": 0,
              "files_uploaded": 0, "failures": []}
     out_notices = []
@@ -528,9 +784,12 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
         return {"success": False, "error": "organization_id missing in event",
                 "response": {}, "stats": stats}
 
-    s = _login(username, password)
+    s, login_err = _login(username, password)
     if not s:
-        return {"success": False, "error": "GST requests-login failed",
+        # Plain-English reason (bad credentials vs transient) for the Failed
+        # Login log so non-technical users understand what to do.
+        return {"success": False,
+                "error": login_err or LOGIN_FAIL_TRANSIENT,
                 "response": {}, "stats": stats}
 
     # Phase 0 — list APIs. _loads is safe: an empty/non-JSON 200 (portal
@@ -595,11 +854,58 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
             "stats": stats,
         }
 
-    folder_to_group = {
+    # Folder → group classification. The GST portal decides a folder's real
+    # category from the case-type + folder CODE (its caseconfig.json), NOT the
+    # folder's display name — e.g. for a DRC-03 Voluntary-Payment case
+    # (caseTypeCd "ADJVP") the "ORDRS" folder renders orderVp.html, which is an
+    # ACKNOWLEDGEMENT, not a normal order. Classifying purely on the folder NAME
+    # ("ORDERS" → orders) mis-filed those acks under Orders. So classify on the
+    # folder CODE, with the case-type-specific overrides the portal itself uses.
+    _FOLDER_CODE_TO_GROUP = {
+        "NOTCE": "notices", "NOTAC": "notices",
+        "REPLY": "replies",
+        "ORDRS": "orders",
+        "INTIM": "intimations", "INORD": "intimations",
+        "APLCN": "applications",
+        "ACKIN": "ack_intimations",
+    }
+    _FOLDER_OVERRIDE = {
+        ("ADJVP", "ORDRS"): "ack_intimations",
+    }
+    _FOLDER_NAME_TO_GROUP = {
         "NOTICES": "notices", "REPLIES": "replies", "ORDERS": "orders",
         "INTIMATIONS": "intimations", "APPLICATIONS": "applications",
-        "ACK./INTIMATION": "ack_intimations",
+        "ACK./INTIMATION": "ack_intimations", "ACK/INTIMATION": "ack_intimations",
     }
+
+    def _classify_folder(case_type_cd, folder_code, folder_name):
+        """Map a case folder to our group using the portal's own logic:
+        case-type override first, then folder CODE, then folder NAME."""
+        fc = (folder_code or "").strip().upper()
+        ct = (case_type_cd or "").strip().upper()
+        if (ct, fc) in _FOLDER_OVERRIDE:
+            return _FOLDER_OVERRIDE[(ct, fc)]
+        if fc in _FOLDER_CODE_TO_GROUP:
+            return _FOLDER_CODE_TO_GROUP[fc]
+        return _FOLDER_NAME_TO_GROUP.get((folder_name or "").strip().upper(), "notices")
+
+    # A document descriptor (dcupdtls) carries a type CODE in `ty`. The portal
+    # UI renders a human "Type of Documents" label from it (adjudicationctrl.js),
+    # e.g. ty "REGC" → "Intimation Of Voluntary Payment DRC-03". Port the known
+    # codes; unknown codes fall back to the folder name so Type is never blank.
+    _DOC_TY_TO_LABEL = {
+        "REGC": "Intimation Of Voluntary Payment DRC-03",
+    }
+
+    def _doc_type_label(ty, folder_name, item_type=""):
+        """Prefer the itemJson's own `type` text (e.g. "Issue Acknowledgement"),
+        then a mapped `ty` code, then the folder name as a last resort."""
+        if item_type and str(item_type).strip():
+            return str(item_type).strip()
+        t = (ty or "").strip().upper()
+        if t in _DOC_TY_TO_LABEL:
+            return _DOC_TY_TO_LABEL[t]
+        return (folder_name or "").strip() or (ty or "")
 
     def _do_normal(row):
         oid = row.get("noticeOrderId") or "x"
@@ -668,61 +974,151 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
         if cid and arn and ctype and gid:
             st_, body_ = _post(s, f"{SERVICES}/litserv/auth/api/case/folder",
                                {"caseId": cid, "gstid": gid, "caseTypeCd": ctype})
-            flat = []
+            # ONE entry per PORTAL ITEM (itemJson) — NOT per attachment — so a
+            # multi-attachment row stays one row (refId reference) and a
+            # zero-attachment item (e.g. an ADJOURNMENT) is still kept.
+            item_list = []
             if st_ == 200:
                 for f in _loads(body_, []):
                     fname = f.get("caseFolderTypeName", "?")
+                    fcode = f.get("caseFolderTypeCd", "")
+                    # Classify the folder ONCE (case-type + folder code aware) so
+                    # e.g. an ADJVP "ORDRS" ack lands in ack_intimations, not orders.
+                    grp = _classify_folder(ctype, fcode, fname)
                     s2, b2 = _post(s, f"{SERVICES}/litserv/auth/api/case/folder/items",
                                    {"caseFolderId": f.get("caseFolderId")})
                     if s2 != 200:
                         continue
                     for it in _loads(b2, []):
                         ij = it.get("itemJson", "")
-                        if isinstance(ij, str) and ij:
-                            for d in _parse_doc_descriptors(ij):
-                                if d.get("id") and d.get("docName"):
-                                    flat.append((fname, d))
-            if flat:
-                ids = list({str(d["id"]) for _, d in flat})
-                s3_, b3 = _post(s, f"{SERVICES}/litserv/auth/api/usr/getEncrypDocIds",
-                                {"arn": arn, "docIdList": ids})
-                enc = _loads(b3, {}) if s3_ == 200 else {}
+                        if not (isinstance(ij, str) and ij):
+                            continue
+                        # itemJson sometimes carries a ready human doc-type
+                        # in its top-level "type" (e.g. "Issue Acknowledgement").
+                        item_type = ""
+                        try:
+                            item_type = (_loads(ij, {}) or {}).get("type") or ""
+                        except Exception:
+                            item_type = ""
+                        # Notice-level dates + section from the itemJson.
+                        dates = _parse_item_dates(ij)
+                        # Reference is the ITEM's refId — NOT an attachment name.
+                        ref_no = it.get("refId") or ""
+                        descriptors = [
+                            d for d in _parse_doc_descriptors(ij)
+                            if d.get("id") and d.get("docName")
+                        ]
+                        first_ty = descriptors[0].get("ty") if descriptors else None
+                        item_list.append({
+                            "fname": fname, "grp": grp, "ref_no": ref_no,
+                            "dtype": _doc_type_label(first_ty, fname, item_type),
+                            # Orders derive their type from caseCfItemMapId /
+                            # act_cd (e.g. DEEMED APPROVAL); "" for non-orders.
+                            "order_type": (
+                                _order_type_from_item(it, ij)
+                                if grp == "orders" else ""
+                            ),
+                            "dates": dates, "descriptors": descriptors,
+                        })
 
-                def fetch_one(item):
-                    fname, d = item
+            if item_list:
+                ids = list({
+                    str(d["id"]) for itm in item_list for d in itm["descriptors"]
+                })
+                enc = {}
+                if ids:
+                    s3_, b3 = _post(s, f"{SERVICES}/litserv/auth/api/usr/getEncrypDocIds",
+                                    {"arn": arn, "docIdList": ids})
+                    enc = _loads(b3, {}) if s3_ == 200 else {}
+
+                def fetch_desc(d):
+                    doc_name = d.get("docName") or str(d.get("id") or "")
+                    # REUSE: skip the portal download when a VALID copy already
+                    # exists at the deterministic org+client+ref key.
+                    pre_ext = _ext_pre_download(doc_name, d.get("ct") or "")
+                    if pre_ext:
+                        reuse_key = _att_key(org_id, client_name, ref, pre_ext, doc_name)
+                        reused = reuse_existing_attachment(
+                            reuse_key, (doc_name or "").strip() or os.path.basename(reuse_key)
+                        )
+                        if reused:
+                            return reused
                     eh = enc.get(str(d.get("id")))
                     if not eh:
                         return None
                     url = f"{SERVICES}/downloadhb/download/new?docId={d['id']}&arn={arn}&eh={eh}"
                     st2_, mime2, data2 = _download(s, url, f"{SERVICES}/services/auth/notices")
-                    ext = _doc_ext(data2, mime2, d.get("docName") or "")
+                    ext = _doc_ext(data2, mime2, doc_name)
                     if not (st2_ == 200 and data2 and ext is not None):
                         return None
-                    att = _upload(data2, org_id, client_name, ref,
-                                  d.get("docName") or str(d["id"]), mime2)
-                    return (fname, d, att) if att else None
+                    return _upload(data2, org_id, client_name, ref, doc_name, mime2)
 
-                with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
-                    for res in ex.map(fetch_one, flat):
-                        if not res:
-                            continue
-                        fname, d, att = res
-                        grp = folder_to_group.get(fname, "notices")
-                        item = {"type": fname, "attachments": [att]}
-                        nm = d.get("docName")
-                        if grp == "replies":
-                            item["arn"] = nm
-                        elif grp == "orders":
-                            item["order_number"] = nm
-                        else:
-                            item["reference_number"] = nm
-                        groups[grp].append(item)
-                        files += 1
+                all_descs = [d for itm in item_list for d in itm["descriptors"]]
+                dl = {}
+                if all_descs:
+                    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+                        for d, att in zip(all_descs, ex.map(fetch_desc, all_descs)):
+                            if att:
+                                dl[str(d["id"])] = att
+
+                # "files fetched" = DISTINCT attachment files actually downloaded
+                # for this case (one physical PDF/DOCX/image = one file), NOT a
+                # per-item sum. `dl` is keyed by the portal doc id, so len(dl) is
+                # the distinct count; the same document linked to several case
+                # items (common on the GST portal) must be counted ONCE, not once
+                # per item. (Was `files += len(atts)` per item → e.g. a real 35
+                # files reported as 107. Excludes notice JSON — only downloaded
+                # attachments land in `dl`.)
+                files += len(dl)
+
+                # Emit ONE group entry per portal item (even with zero attachments).
+                for itm in item_list:
+                    grp, dates = itm["grp"], itm["dates"]
+                    atts = [dl[str(d["id"])] for d in itm["descriptors"]
+                            if str(d["id"]) in dl]
+                    # `type` = the portal's per-item type (e.g. NOTICE /
+                    # ADJOURNMENT from sdtls.*.type), falling back to the folder
+                    # name only when absent. `document_type` is the portal's
+                    # human "Type of Documents" label.
+                    item = {"type": dates.get("type") or itm["fname"],
+                            "document_type": itm["dtype"],
+                            "attachments": atts}
+                    if grp == "replies":
+                        item["arn"] = itm["ref_no"]
+                        item["reply_date"] = _clean_date(dates.get("reply_date"))
+                        item["reply_filed_against"] = dates.get("reply_filed_against") or ""
+                        item["personal_hearing"] = dates.get("personal_hearing") or ""
+                    elif grp == "orders":
+                        # Prefer the portal's order type (DEEMED APPROVAL /
+                        # ACCEPTANCE ORDER / REJECTION ORDER from caseCfItemMapId);
+                        # fall back to the folder name only when unrecognised.
+                        if itm.get("order_type"):
+                            item["type"] = itm["order_type"]
+                        item["order_number"] = itm["ref_no"]
+                        item["order_date"] = _clean_date(dates.get("issue_date"))
+                    else:
+                        item["reference_number"] = itm["ref_no"]
+                        # Notice-level dates from the itemJson.
+                        item["issue_date"] = _clean_date(dates.get("issue_date"))
+                        item["due_date"] = _clean_date(dates.get("due_date"))
+                        item["section"] = dates.get("section") or ""
+                        # Personal Hearing (sdtls.*.pershrng) — portal column.
+                        item["personal_hearing"] = dates.get("personal_hearing") or ""
+                    groups[grp].append(item)
+        # Additional-Notice due date = latest due date across its Notices
+        # sub-table (ISO-cleaned, so max string = latest date). None → "NA"
+        # when the case has no Notices rows. Single source for reminders +
+        # due-date calcs; identical rule to the backend fetch paths.
+        _notice_due_dates = [
+            n.get("due_date") for n in groups.get("notices", []) if n.get("due_date")
+        ]
+        _latest_due_date = max(_notice_due_dates) if _notice_due_dates else None
         return {"kind": "additional", "files": files, "fails": [], "row": {
             "ref_id": ref, "arn": arn, "type": row.get("caseTypeName") or ctype,
             "issue_date": _clean_date(
                 row.get("assignmentDt") or row.get("assgnDtStr") or row.get("dtOfIssue")
             ),
+            "due_date": _latest_due_date,
             "description": row.get("taskDesc") or "",
             "case_details": {
                 "reference_number": arn, "case_id": str(cid or ""), "gstin": gid,
@@ -752,17 +1148,28 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
     results = []
     phase_t0 = time.monotonic()
     files_count = 0
-    with ThreadPoolExecutor(max_workers=row_workers) as ex:
-        futures = [ex.submit(_timed, fn, row) for fn, row in tasks]
-        for fut in as_completed(futures):
-            try:
-                r = fut.result()
-                if r is not None:
-                    results.append(r)
-                    files_count += r.get("files", 0)
-            except Exception as e:
-                stats["failures"].append(f"row task error: {e}")
+    # Keep the portal session warm for the duration of the download pool so it
+    # doesn't expire mid-fetch (background thread pings the keep-alive endpoint).
+    _keepalive = _KeepAliveThread(s)
+    _keepalive.start()
+    try:
+        with ThreadPoolExecutor(max_workers=row_workers) as ex:
+            futures = [ex.submit(_timed, fn, row) for fn, row in tasks]
+            for fut in as_completed(futures):
+                try:
+                    r = fut.result()
+                    if r is not None:
+                        results.append(r)
+                        files_count += r.get("files", 0)
+                except Exception as e:
+                    stats["failures"].append(f"row task error: {e}")
+    finally:
+        _keepalive.stop()
     stats["fetch_seconds"] = round(time.monotonic() - phase_t0, 2)
+    # Of the fetch phase, how much was spent uploading files to S3 (the rest is
+    # portal list/download + parsing). Sum of every upload_file_to_s3 PUT.
+    with _s3_upload_lock:
+        stats["s3_upload_seconds"] = round(_s3_upload_seconds, 2)
 
     per_notice = []
     for r in results:
@@ -860,6 +1267,10 @@ def lambda_handler(event, context):
     """
     handler_start_time = time.time()
     try:
+        # Apply S3 credentials/config from the event (System Configuration)
+        # before any upload.
+        configure_s3(event.get("s3_config"))
+
         username = event.get("username")
         password = event.get("password")
         client_name = event.get("client_name")
