@@ -40,3 +40,5 @@ __pycache__/
 # OS / editor cruft
 .DS_Store
 *.swp
+
+.claude-push-config.json

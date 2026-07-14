@@ -746,10 +746,48 @@ def _gstin_from_username(username, state_cd="06"):
     return first14 + _gstin_check_digit(first14)
 
 
+def _gstin_from_gstr3a(s, notices):
+    """Ask the PORTAL for the logged-in taxpayer's GSTIN, via any GSTR-3A row.
+
+    The GSTR-3A summary endpoint is keyed by the notice's OWN ids
+    (defaulter_id + order_id) — it needs no GSTIN — and its payload names the
+    taxpayer: {"data": {"gstin": "...", "name": ...}}. This is the only
+    session-derived source that still works when the login username is an
+    arbitrary handle rather than the GSTIN's PAN+entity middle, which is
+    exactly what `_gstin_from_username` cannot reconstruct from.
+
+    Returns "" when the client has no GSTR-3A notice or the call fails."""
+    for row in notices:
+        if not isinstance(row, dict) or row.get("applnCd") != "APL3A":
+            continue
+        appdef, oid = row.get("appDefId"), row.get("noticeOrderId")
+        if not (appdef and oid):
+            continue
+        try:
+            r = s.get(f"{RETURN}/returns/auth/api/gstr3a/summary",
+                      params={"defaulter_id": appdef, "order_id": oid}, timeout=30,
+                      headers={"Accept": "application/json, text/plain, */*",
+                               "Referer": f"{RETURN}/returns/auth/gstr3a"})
+            if r.status_code != 200:
+                continue
+            g = str((((r.json() or {}).get("data")) or {}).get("gstin") or "").strip().upper()
+            if re.fullmatch(r"[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]", g):
+                return g
+        except Exception:
+            continue  # try the next GSTR-3A row
+    return ""
+
+
 def _resolve_session_gstin(s, notices, username, db_gstin):
     """Resolve the session's GSTIN without requiring it to be stored:
     row/db value first, else reconstruct from the username and verify
-    against the case-task list, scanning state codes until accepted."""
+    against the case-task list, scanning state codes until accepted, else
+    ask the portal via a GSTR-3A summary.
+
+    The last step exists because reconstruction only works when the login
+    username IS the PAN+entity middle. A client can log in with an arbitrary
+    username, in which case it yields nothing and the additional-notices list
+    was silently skipped (client came back with 0 additional notices)."""
     g = _gstin_from(notices, db_gstin)
     if g:
         return g
@@ -763,7 +801,8 @@ def _resolve_session_gstin(s, notices, username, db_gstin):
             s, f"{SERVICES}/litserv/auth/api/case/task/get", {"gstIn": cand})
         if st2 == 200 and isinstance(_loads(body2, None), list):
             return cand
-    return ""
+    # Last resort: the portal itself. Authoritative and costs one call.
+    return _gstin_from_gstr3a(s, notices)
 
 
 # ---------------------------------------------------------------------------

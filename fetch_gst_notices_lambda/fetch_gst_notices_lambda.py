@@ -51,8 +51,8 @@ except ImportError:
 AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "nabsprodbucket")
 
-# 2Captcha API Key
-CAPTCHA_API_KEY = "72808e06303338084d893648f0146162"
+# 2Captcha API Key — NOT hardcoded; comes from the CAPTCHA_API_KEY env var.
+CAPTCHA_API_KEY = os.environ.get("CAPTCHA_API_KEY", "")
 
 # Shared S3 client (reused across uploads to avoid per-call initialization overhead)
 _s3_client = None

@@ -55,26 +55,60 @@ except ImportError:
     SELENIUM_AVAILABLE = False
     logger.warning("Selenium not available - running in test mode")
 
-# AWS S3 Configuration. Credentials are NOT hardcoded — they come from the
-# Lambda execution role by default (the role carries finbuddy-lambda-s3-policy).
-# Explicit keys are honoured only if AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-# are set as env vars (local/dev), otherwise boto3 resolves the role creds.
+# AWS S3 Configuration.
+# Credential precedence: System Configuration (event s3_config) -> env vars ->
+# the Lambda execution role.
+#
+# There is deliberately NO hardcoded key fallback. A previous revision carried a
+# real access key/secret in this file, justified as "prod + UAT run on these keys
+# and cannot be redeployed". That was not true: the execution role
+# (fetch-notice-income-tax-role-97w35p21) has the finbuddy-lambda-s3-policy
+# attached, which already grants PutObject/GetObject/ListBucket on nabsprodbucket,
+# the exact bucket this handler writes to. With no explicit keys, boto3 picks the
+# role up automatically. Never put credentials back in this file.
 AWS_REGION = os.environ.get("AWS_REGION", "ap-south-1")
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "nabsprodbucket")
 
-# 2Captcha API Key
-CAPTCHA_API_KEY = "72808e06303338084d893648f0146162"
+# 2Captcha API Key - NOT hardcoded; comes from the CAPTCHA_API_KEY env var.
+CAPTCHA_API_KEY = os.environ.get("CAPTCHA_API_KEY", "")
+
+# Per-invocation S3 config delivered in the event payload (s3_config) by the
+# orchestrator, sourced from FastAPI's System Configuration. lambda_handler
+# calls configure_s3() before any upload.
+_S3_CONFIG = {}
 
 # Shared S3 client (reused across uploads to avoid per-call initialization overhead)
 _s3_client = None
 
+
+def configure_s3(s3_config):
+    """Apply event-provided S3 config (keys/region/bucket) from System
+    Configuration. Resets the cached client. No-op if s3_config is empty."""
+    global _S3_CONFIG, _s3_client, S3_BUCKET, AWS_REGION
+    if not s3_config:
+        return
+    _S3_CONFIG = dict(s3_config)
+    if _S3_CONFIG.get("region"):
+        AWS_REGION = _S3_CONFIG["region"]
+    if _S3_CONFIG.get("bucket"):
+        S3_BUCKET = _S3_CONFIG["bucket"]
+    _s3_client = None
+
+
 def _get_s3_client():
-    """Get or create a shared S3 client (saves ~0.5s per upload vs creating new client each time)"""
+    """Get or create a shared S3 client. Credential precedence:
+    event s3_config (System Configuration) -> AWS_*_KEY env vars ->
+    the Lambda execution role (boto3's own default chain).
+
+    When neither the event nor the env supplies keys, we pass none and let boto3
+    resolve the execution role, which holds the S3 grant on nabsprodbucket."""
     global _s3_client
     if _s3_client is None:
         kwargs = {"region_name": AWS_REGION, "config": Config(signature_version='s3v4')}
-        ak = os.environ.get("AWS_ACCESS_KEY_ID")
-        sk = os.environ.get("AWS_SECRET_ACCESS_KEY")
+        ak = (_S3_CONFIG.get("aws_access_key_id")
+              or os.environ.get("AWS_ACCESS_KEY_ID"))
+        sk = (_S3_CONFIG.get("aws_secret_access_key")
+              or os.environ.get("AWS_SECRET_ACCESS_KEY"))
         if ak and sk:
             kwargs["aws_access_key_id"] = ak
             kwargs["aws_secret_access_key"] = sk
@@ -1504,6 +1538,10 @@ def lambda_handler(event, context):
     """
     handler_start_time = time.time()
     try:
+        # Apply S3 credentials/config from the event (System Configuration)
+        # before any upload.
+        configure_s3(event.get('s3_config'))
+
         username = event.get('username')
         password = event.get('password')
         client_name = event.get('client_name')

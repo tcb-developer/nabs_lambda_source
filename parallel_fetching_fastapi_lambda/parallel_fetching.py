@@ -507,14 +507,19 @@ def lambda_handler(event, context):
         # Extract webhook config for callback
         webhook_config = event.get('webhook_config', {})
 
-        logger.info(f"Starting batch-controlled fetching for {len(income_tax_clients)} Income Tax clients and {len(gst_clients)} GST clients")
+        logger.info(f"Starting batch-controlled fetching for {len(income_tax_clients)} Income Tax clients, {len(gst_clients)} GST clients and {len(tds_clients)} TDS clients")
         logger.info(f"Configuration: batch_size={batch_size}, max_workers={max_workers}, IT_delay={income_tax_delay}s, GST_delay={gst_delay}s, inter_batch_delay={inter_batch_delay}s, fallback={enable_fallback}")
 
-        if not income_tax_clients and not gst_clients:
+        # NOTE: tds_clients MUST be part of this gate. It was omitted when TDS
+        # routing was added, so a TDS-only event (which is exactly what the
+        # backend's trigger_tds_lambda sends) was rejected here with a 400
+        # before it could ever reach the TDS fan-out below. The TDS worker was
+        # therefore unreachable even once it was deployed.
+        if not income_tax_clients and not gst_clients and not tds_clients:
             return {
                 'statusCode': 400,
                 'body': json.dumps({
-                    'error': 'No clients provided. Please provide income_tax_clients or gst_clients array.'
+                    'error': 'No clients provided. Please provide income_tax_clients, gst_clients or tds_clients array.'
                 })
             }
 
@@ -618,9 +623,19 @@ def lambda_handler(event, context):
                     # Stagger submissions within the batch
                     client_delay = client_idx * delay
 
+                    # Dispatch on portal_type. This MUST stay a three-way
+                    # branch: an `else: -> gst` fallback silently handed every
+                    # TDS client to the GST worker, because `tds` is neither
+                    # 'income_tax' nor an explicit case.
                     if portal_type == 'income_tax':
                         future = executor.submit(
                             process_income_tax_client_with_delay,
+                            client,
+                            client_delay
+                        )
+                    elif portal_type == 'tds':
+                        future = executor.submit(
+                            process_tds_client_with_delay,
                             client,
                             client_delay
                         )
@@ -649,6 +664,8 @@ def lambda_handler(event, context):
 
                         if portal_type == 'income_tax':
                             results['income_tax_results'].append(result)
+                        elif portal_type == 'tds':
+                            results['tds_results'].append(result)
                         else:
                             results['gst_results'].append(result)
 
@@ -681,6 +698,8 @@ def lambda_handler(event, context):
 
                         if portal_type == 'income_tax':
                             results['income_tax_results'].append(error_result)
+                        elif portal_type == 'tds':
+                            results['tds_results'].append(error_result)
                         else:
                             results['gst_results'].append(error_result)
 
