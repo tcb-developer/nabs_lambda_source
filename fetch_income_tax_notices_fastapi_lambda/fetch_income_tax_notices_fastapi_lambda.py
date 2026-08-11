@@ -23,6 +23,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# AWS Lambda's python runtime pre-installs a root handler, which makes
+# basicConfig(level=...) a SILENT NO-OP — the effective level stays WARNING and
+# every logger.info() in this worker (File saved / SKIP proceeding / Added
+# closure...) never reaches CloudWatch. Set the module logger's
+# level explicitly so INFO diagnostics actually appear.
+logger.setLevel(logging.INFO)
 
 # constants
 base_url = "https://eportal.incometax.gov.in/iec"
@@ -524,9 +530,74 @@ class SessionHolder:
             return self._login_cookies
 
 
+# --- Document-download handshake (2026-08-10) --------------------------------
+# The IT portal gates GET /document/{docId} behind a per-request nonce: first
+# GET /document/enc/{pid} mints an encrypted `pcode`, then the document is
+# fetched with the custom headers caller/pid/pcode/applnId (the response's
+# Access-Control-Allow-Headers advertises exactly these). `pid` is a
+# client-chosen integer that only has to MATCH between the two calls (verified
+# empirically — any value works; a collision between pool threads is harmless
+# since each enc-call mints its own pcode). Reply attachments on "Of Other
+# PAN/TAN" proceedings return HTTP 902 on a plain GET but download fine via
+# this handshake — so 902 is NOT a permanent authorization block.
+_doc_pid = 0
+_doc_pid_lock = threading.Lock()
+
+
+def _next_doc_pid():
+    # The portal's /document/enc/{pid} ONLY accepts pid in 1..1000 — pid >= 1001
+    # returns HTTP 500 ("Internal Server Error"), which broke the whole handshake
+    # (enc 500 -> no pcode -> doc 902 -> skip). pid is just a nonce that must
+    # match between the enc call and the doc call, so cycle within 1..1000.
+    global _doc_pid
+    with _doc_pid_lock:
+        _doc_pid = (_doc_pid % 1000) + 1
+        return _doc_pid
+
+
+def _it_document_response(doc_id, cookies_box, appln_id=None):
+    """Fetch a document via the enc -> pcode -> doc handshake.
+
+    Returns the document's requests.Response on success (HTTP 200), else None so
+    the caller can fall back to / stay on the plain-GET path. Never raises.
+    """
+    try:
+        base_jar = cookies_box["cookies"].cookies
+        pid = _next_doc_pid()
+        enc = http_session().get(
+            f"{base_url}/document/enc/{pid}",
+            headers={**headers, "caller": "FO"},
+            cookies=base_jar, timeout=timeout_sec,
+        )
+        if enc.status_code != 200:
+            logger.warning(f"[HS] doc={doc_id} enc failed ({enc.status_code})")
+            return None
+        pcode = (enc.json() or {}).get("encryptedValue")
+        if not pcode:
+            logger.warning(f"[HS] doc={doc_id} enc=200 but empty pcode")
+            return None
+        # Carry the enc call's session-cookie rotation into the doc call.
+        doc_cookies = {c.name: c.value for c in base_jar}
+        doc_cookies.update({c.name: c.value for c in enc.cookies})
+        dl_headers = {**headers, "caller": "FO", "pid": str(pid), "pcode": pcode}
+        if appln_id is not None:
+            dl_headers["applnId"] = str(appln_id)
+        doc = http_session().get(
+            f"{base_url}/document/{doc_id}",
+            headers=dl_headers, cookies=doc_cookies, timeout=timeout_sec,
+        )
+        if doc.status_code != 200:
+            logger.info(f"[HS] doc={doc_id} handshake doc GET -> {doc.status_code}")
+            return None
+        return doc
+    except Exception as e:
+        logger.warning(f"Document handshake failed for doc {doc_id}: {e}")
+        return None
+
+
 def _download_one_document(doc_id, link_text, full_file_path, file_info,
                            cookies_box, dl_lock, username, password,
-                           client_name, label="file"):
+                           client_name, label="file", appln_id=None):
     """Download a SINGLE document by id and upload it to S3, mutating + returning
     `file_info`. Shared by the reply-file and notice-file paths (previously two
     ~identical inline loops) so file-level parallelism can call it from a pool.
@@ -567,6 +638,22 @@ def _download_one_document(doc_id, link_text, full_file_path, file_info,
                             cookies_box["cookies"], username, password, client_name)
                 continue
 
+            # HTTP 902 is NOT a permanent block — the portal gates the document
+            # behind the enc -> pcode -> doc handshake (see _it_document_response).
+            # A plain GET returns 902; the handshake downloads it fine (this is
+            # how the browser fetches "Of Other PAN/TAN" reply attachments). Try
+            # the handshake before giving up; only skip if it ALSO fails.
+            if file_res.status_code == 902:
+                hs_res = _it_document_response(doc_id, cookies_box, appln_id)
+                if hs_res is not None and hs_res.status_code == 200:
+                    file_res = hs_res  # recovered — fall through to the save path
+                else:
+                    logger.info(f"{label} not downloadable (HTTP 902, handshake did not recover) — skipping file, keeping metadata: {link_text}")
+                    file_info['downloaded'] = False
+                    file_info['skipped'] = True
+                    file_info['error'] = "unauthorized (902): portal blocks this document even via the handshake"
+                    break
+
             # IT portal custom error or server error - retry
             if file_res.status_code != 200:
                 logger.warning(f"{label} download attempt {dl_attempt}/{FILE_DOWNLOAD_ATTEMPTS} failed: {link_text}, Status Code: {file_res.status_code}")
@@ -600,7 +687,9 @@ def _download_one_document(doc_id, link_text, full_file_path, file_info,
             logger.error(f"{label} download unexpected error: {link_text}: {e}")
             break  # don't retry unknown errors
 
-    if not download_success:
+    if not download_success and not file_info.get('skipped'):
+        # A deliberate skip (e.g. 902 Unauthorized) already set a clean status +
+        # single info log above — don't overwrite it with a generic ERROR.
         logger.error(f"{label} download FAILED after {FILE_DOWNLOAD_ATTEMPTS} attempts: {link_text}")
         file_info['downloaded'] = False
         file_info['error'] = f'Failed after {FILE_DOWNLOAD_ATTEMPTS} download attempts'
@@ -706,8 +795,80 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                             'date': make_date(status_line.get('date')),
                         })
 
-                    # Fetch proceeding details with retry
                     proceeding_req_id = epro.get("proceedingReqId")
+
+                    # --- CLOSURE ORDER (missing-notice fix, 2026-07-16) ---------------
+                    # A CLOSED proceeding can carry a "Closure Order" document that is
+                    # NOT part of eProceedingDetailsService. For approval / closure-only
+                    # proceedings the inner notice list (viewNoticeCount) is 0, so the
+                    # whole proceeding used to be skipped below (`if not res_5_data`) and
+                    # its closure order was never fetched — that is the source of the
+                    # missing notices. Fetch it here, INDEPENDENT of the notice list, via
+                    # the portal's `downloadClosureOrder` service (which returns
+                    # satDocDetlList[].satDocId), then download each PDF through the same
+                    # GET /document/{id} helper used for notice files.
+                    closure_seq = epro.get("proceedingClosureOrder")
+                    if closure_seq:
+                        closure_uid = f"{proceeding_req_id}-closure-{closure_seq}"
+                        if closure_uid in existing_notice_ids:
+                            logger.info(f"SKIP closure order {closure_uid} (already in Frappe)")
+                        else:
+                            try:
+                                res_co = retry_request('post', f"{base_url}/returnservicesapi/auth/getEntity", json={
+                                    "serviceName": "downloadClosureOrder",
+                                    "procdngReqId": proceeding_req_id,
+                                    "loggedInUserId": username,
+                                    "header": {"formName": "FO-041_PCDNG"}
+                                }, headers=headers_with_sn("downloadClosureOrder"), cookies=session.cookies.cookies, session=session)
+                                res_co_data = res_co.json() or {}
+                                sat_docs = res_co_data.get("satDocDetlList") or []
+
+                                if not sat_docs:
+                                    logger.warning(f"Closure order for proceeding {proceeding_req_id} returned no documents")
+                                else:
+                                    closure_record = dict(e_proceeding_document_data)
+                                    closure_record['status_map'] = list(e_proceeding_document_data['status_map'])
+                                    closure_record['unique_e_pro_id'] = closure_uid
+                                    closure_record['notice_section'] = "Closure Order"
+                                    closure_record['notice_din'] = str(closure_seq)
+                                    closure_record['reply_files'] = []
+                                    if epro.get('proceedingClosureDate'):
+                                        closure_record['notice_sent_date'] = make_date(
+                                            epro.get('proceedingClosureDate'), frappe_date=True)
+
+                                    _co_lock = threading.Lock()
+                                    _co_box = {"cookies": session.cookies, "session": session}
+                                    for _d in sat_docs:
+                                        _sat_id = _d.get('satDocId')
+                                        if not _sat_id:
+                                            continue
+                                        _fname = _d.get('docNam') or f"ClosureOrder-{closure_seq}.pdf"
+                                        _base, _ext = os.path.splitext(_fname)
+                                        if not _ext:
+                                            _ext = ".pdf"
+                                        _link = f"{_base}-{_sat_id}{_ext}"
+                                        _path = os.path.join(download_dir, _link) if download_dir else None
+                                        _fi = {'file_name': _link, 'file_path': _path,
+                                               'doc_id': _sat_id, 'original_name': _fname}
+                                        if download_dir and _link not in downloaded_files:
+                                            _download_one_document(
+                                                _sat_id, _link, _path, _fi,
+                                                _co_box, _co_lock, username, password,
+                                                client_name, label="Closure order")
+                                        else:
+                                            _fi['downloaded'] = False
+                                            _fi['skipped'] = True
+                                        closure_record['notice_letter'] = _fi
+
+                                    e_proceedings_data.append(closure_record)
+                                    logger.info(f"Added closure order {closure_uid} for proceeding {proceeding_req_id}")
+                            except Exception as _ce:
+                                error_msg = f"Error fetching closure order for {proceeding_req_id}: {str(_ce)}"
+                                logger.error(error_msg)
+                                errors.append({"type": "closure_order", "proceeding": proceeding_req_id, "error": error_msg})
+                    # --- end closure order ------------------------------------------
+
+                    # Fetch proceeding details with retry
                     res_5 = retry_request('post', f"{base_url}/returnservicesapi/auth/getEntity", json={
                         "serviceName": "eProceedingDetailsService",
                         "proceedingReqId": proceeding_req_id,
@@ -797,6 +958,9 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                                     # list/dict assignment stays on this thread.
                                     _reply_tasks = []
                                     for remark in remark_notice_list:
+                                        # responseId is the `applnId` the document
+                                        # handshake needs for this remark's files.
+                                        _appln_id = remark.get('responseId')
                                         for d in remark.get('attachmentLst', None):
                                             if not d.get('docId'):
                                                 continue
@@ -813,15 +977,15 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                                                 'original_name': file_name,
                                                 'is_acknowledgement': "acknowledgement" in file_name.lower()
                                             }
-                                            _reply_tasks.append((d.get('docId'), link_text, full_file_path, file_info))
+                                            _reply_tasks.append((d.get('docId'), link_text, full_file_path, file_info, _appln_id))
 
                                     def _do_reply(task):
-                                        _doc_id, _link, _path, _fi = task
+                                        _doc_id, _link, _path, _fi, _appln = task
                                         if download_dir and _link not in downloaded_files:
                                             _download_one_document(
                                                 _doc_id, _link, _path, _fi,
                                                 _cookies_box, _dl_lock, username, password,
-                                                client_name, label="Reply file")
+                                                client_name, label="Reply file", appln_id=_appln)
                                         else:
                                             _fi['downloaded'] = False
                                             _fi['skipped'] = True

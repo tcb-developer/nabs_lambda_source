@@ -88,7 +88,11 @@ _CAPTCHA_RETRY_MARKERS = ("verification code", "captcha", "does not match with i
 
 # In-lambda quarter parallelism (Q3 = small cap). Each quarter worker is its own
 # headless Chrome bridged from the same JWT. 2 fits the 3008MB-sized lambda.
-_QUARTER_CONCURRENCY = int(os.environ.get("TDS_QUARTER_FETCH_CONCURRENCY") or 2)
+# MUST stay 1. Chrome only starts on this Lambda layer with --single-process
+# (see setup_chrome_options), and --single-process forbids more than one live
+# Chrome. Concurrent per-quarter Chromes crash the browser, which is why TDS
+# fetched nothing. Quarters are therefore fetched serially on the main driver.
+_QUARTER_CONCURRENCY = 1
 
 # JR zip password template + quarter→TRACES dropdown value (ported from tds_gov).
 _JR_QUARTER_VALUE_MAP = {"Q1": "3", "Q2": "4", "Q3": "5", "Q4": "6"}
@@ -297,9 +301,10 @@ def api_login(tan, password, sub_user_pan_id=""):
 
 
 # ===========================================================================
-# Headless Chrome (ported from fetch_gst_notices_fastapi_lambda) — with the
-# parallel-safe tweak: NO --single-process (it breaks multiple concurrent
-# Chromes, which the in-lambda parallel quarters need).
+# Headless Chrome (ported from fetch_gst_notices_fastapi_lambda). Uses
+# --single-process like the GST worker: it is required for Chrome to start on
+# this Lambda layer, and it means quarters must be fetched one at a time
+# (_QUARTER_CONCURRENCY = 1) rather than in parallel.
 # ===========================================================================
 def setup_chrome_options(download_dir, tmp_folder):
     options = Options()
@@ -310,8 +315,13 @@ def setup_chrome_options(download_dir, tmp_folder):
         os.environ["FONTCONFIG_PATH"] = "/opt/etc/fonts"
         options.add_argument("--headless")
         options.add_argument("--no-sandbox")
-        # NOTE: deliberately NOT --single-process — we run multiple Chromes in
-        # parallel (per-quarter) and single-process crashes with >1 browser.
+        # --single-process is REQUIRED for Chrome to start on this Lambda layer
+        # (headless-chrome-selenium). Without it Chrome exits abnormally at launch
+        # ("chrome not reachable"), so no notices were ever fetched. The working
+        # GST worker keeps this flag too. It allows only one live Chrome, so
+        # quarters run serially (_QUARTER_CONCURRENCY = 1) and the main driver is
+        # closed before the JR phase opens its own driver.
+        options.add_argument("--single-process")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
         options.add_argument("--hide-scrollbars")
@@ -371,16 +381,34 @@ def bridge_into_driver(driver, access, refresh):
     except Exception as ce:
         logger.error("CDP bridge header set failed: %s", str(ce))
         return False
-    driver.get(PREAUTH_BRIDGE_URL)
-    time.sleep(4)
-    try:
-        driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {}})
-    except Exception:
-        pass
-    driver.get(f"{OLD_PORTAL_BASE}/app/ded/dashboard.xhtml")
-    time.sleep(3)
-    page = driver.page_source or ""
-    return "Welcome" in page and not re.search(r"Welcome\s*\(\s*\)", page)
+    # Mirror of backend events/tds_gov.py bridge_into_driver alert handling:
+    # a stale login attempt can leave a pending "session has expired" alert
+    # that aborts the bridge. Accept and retry the navigation once.
+    from selenium.common.exceptions import UnexpectedAlertPresentException
+
+    def _navigate_and_check():
+        driver.get(PREAUTH_BRIDGE_URL)
+        time.sleep(4)
+        try:
+            driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {}})
+        except Exception:
+            pass
+        driver.get(f"{OLD_PORTAL_BASE}/app/ded/dashboard.xhtml")
+        time.sleep(3)
+        page = driver.page_source or ""
+        return "Welcome" in page and not re.search(r"Welcome\s*\(\s*\)", page)
+
+    _accept_alert_if_present(driver)
+    for attempt in (1, 2):
+        try:
+            return _navigate_and_check()
+        except UnexpectedAlertPresentException as ae:
+            logger.warning("TDS bridge: unexpected alert on attempt %d (%s); "
+                           "accepting and retrying", attempt, str(ae)[:120])
+            _accept_alert_if_present(driver)
+            if attempt == 2:
+                return False
+    return False
 
 
 # ===========================================================================
@@ -881,6 +909,17 @@ def go_to_justification_report_request_form(driver, q):
         logger.error("Error in go_to_justification_report_request_form: %s", str(e))
 
 
+def _fmt_jr_amount(value):
+    """Mirror of backend _fmt_jr_amount: TRACES KYC amount fields require the
+    99999.99 two-decimal format; six-decimal strings are rejected with
+    "Invalid Amount Format"."""
+    from decimal import Decimal
+    try:
+        return "{:.2f}".format(Decimal(str(value)))
+    except Exception:
+        return str(value)
+
+
 def fill_values_for_justification_report(driver, q):
     """Fill the TRACES KYC/JR-request form from the quarter's values, submit, and
     capture the new request number + authcode.
@@ -891,6 +930,26 @@ def fill_values_for_justification_report(driver, q):
     """
     try:
         time.sleep(3)
+        _accept_alert_if_present(driver)
+
+        # Mirror of backend events/tds_gov.py: DSC-registered deductors get a
+        # "Choose KYC Flow" interstitial (kyc3formdsc.xhtml) offering
+        # "Validate DSC" (#dsckyc) or normal KYC (#normalkyc "Proceed").
+        # og_app never saw this page. Take the normal-KYC path, then wait for
+        # the classic challan form instead of failing on an immediate find.
+        try:
+            _normal_btn = driver.find_element(By.ID, "normalkyc")
+            if _normal_btn.is_displayed():
+                logger.info("JR: DSC 'Choose KYC Flow' interstitial detected; "
+                            "proceeding with normal KYC")
+                _normal_btn.click()
+                _accept_alert_if_present(driver)
+                time.sleep(3)
+        except NoSuchElementException:
+            pass
+
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.ID, "token")))
 
         token_number_field = driver.find_element(By.ID, "token")
         cin_bin_check = driver.find_element(By.ID, "cinbinCheck")
@@ -934,7 +993,7 @@ def fill_values_for_justification_report(driver, q):
             csn.send_keys(q["challan_serial_number"])
 
         if q.get("challan_amount"):
-            chlnamt.send_keys(str(q["challan_amount"]))
+            chlnamt.send_keys(_fmt_jr_amount(q["challan_amount"]))
 
         if q.get("cd_record_number"):
             cdrecnum.send_keys(q["cd_record_number"])
@@ -950,11 +1009,11 @@ def fill_values_for_justification_report(driver, q):
         if q.get("pan_3"):
             pan_3.send_keys(q["pan_3"])
         if q.get("amt_1"):
-            amt_1.send_keys(str(q["amt_1"]))
+            amt_1.send_keys(_fmt_jr_amount(q["amt_1"]))
         if q.get("amt_2"):
-            amt_2.send_keys(str(q["amt_2"]))
+            amt_2.send_keys(_fmt_jr_amount(q["amt_2"]))
         if q.get("amt_3"):
-            amt_3.send_keys(str(q["amt_3"]))
+            amt_3.send_keys(_fmt_jr_amount(q["amt_3"]))
 
         time.sleep(2)
         driver.execute_script("arguments[0].scrollIntoView(true);", click_KYC)
@@ -1274,6 +1333,19 @@ def process_tds_notices(client_name, tan, username, password, with_jr=True):
         # 3. Scrape every FY/quarter (parallel quarters bridge their own drivers
         #    from the same JWT — passed through explicitly).
         financial_years = scrape_demand_and_quarters(driver, access, refresh)
+
+        # Close the main driver before the JR phase. With --single-process (needed
+        # for Chrome to start on this Lambda layer) only one Chrome may be alive at
+        # a time, and process_justification_reports opens its own bridged driver.
+        try:
+            logout_user(driver)
+        except Exception:
+            pass
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        driver = None
 
         # 4. Optional Justification-Report request/download per quarter.
         if with_jr and financial_years:

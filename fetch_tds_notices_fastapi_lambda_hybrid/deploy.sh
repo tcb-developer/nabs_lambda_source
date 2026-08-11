@@ -49,8 +49,21 @@ echo "==> Cleaning previous build"
 rm -rf "$BUILD" "$ZIP"
 mkdir -p "$BUILD"
 
-echo "==> Copying source (module only — selenium/requests/bs4 come from layers)"
+echo "==> Copying source (selenium + requests come from layers; bs4 is bundled below)"
 cp "$HERE/fetch_tds_notices_fastapi_lambda_hybrid.py" "$BUILD/"
+
+# bs4 is NOT in the attached layers (headless-chrome-selenium + requests-python),
+# yet this worker parses TRACES demand/quarter tables with BeautifulSoup. Without
+# it, `from bs4 import BeautifulSoup` fails, BeautifulSoup is None, and every
+# parse throws "'NoneType' object is not callable" so zero notices are returned.
+# beautifulsoup4 + soupsieve are pure Python (no compiled extensions), so a plain
+# host pip install into the build dir is portable to the Lambda runtime.
+# Pin to versions that support the worker's runtime (python3.8). The latest
+# soupsieve requires py3.10+, so an unpinned install (done with a newer host
+# Python) would ship a soupsieve that cannot import on py3.8. These pins are
+# pure Python and py3.8-safe.
+echo "==> Bundling bs4 (beautifulsoup4 + soupsieve, py3.8-pinned) — not in the layers"
+python3 -m pip install --quiet --target "$BUILD" "beautifulsoup4==4.12.3" "soupsieve==2.5"
 
 echo "==> Zipping"
 ( cd "$BUILD" && zip -qr "$ZIP" . )
@@ -98,9 +111,10 @@ cat <<'ENVHELP'
       --function-name fetch_tds_notices_fastapi_lambda_hybrid --region ap-south-1 \
       --environment 'Variables={
           CAPTCHA_API_KEY=<2captcha key>,
-          WEBHOOK_BASE_URL=<fastapi base url>,
-          TDS_QUARTER_FETCH_CONCURRENCY=2
+          WEBHOOK_BASE_URL=<fastapi base url>
       }'
+  (TDS_QUARTER_FETCH_CONCURRENCY is no longer read: quarters are forced serial
+   in code because --single-process allows only one live Chrome on this layer.)
 
   Notes:
    - AWS credentials: prefer the function's execution role (no AWS_ACCESS_KEY_ID
