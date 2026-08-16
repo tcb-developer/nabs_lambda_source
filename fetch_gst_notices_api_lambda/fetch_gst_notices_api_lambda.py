@@ -1190,6 +1190,9 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                 "due_date": blob.get("noticeDueDate") or blob.get("dueDate") or "",
                 "section": blob.get("sectionNumber") or "",
                 "issued_by": blob.get("issuedByNm") or "",
+                # The notice this reply answers — the Replies table's
+                # "Reply Filed Against" column.
+                "against_ref": blob.get("noticeReferenceNumber") or "",
                 "descriptors": _audit_item_docs(blob),
             })
         return parsed
@@ -1308,19 +1311,35 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
         for itm in items:
             grp = "notices" if itm["folder_cd"] in ("NOTCE", "", "PRCED") else \
                 _classify_folder(ctype, itm["folder_cd"], "")
-            groups.setdefault(grp, []).append({
+            item = {
                 "type": itm["type"] or row.get("taskDesc") or "Audit",
                 "document_type": meta.get("statusDesc") or "",
-                "reference_number": itm["ref_no"] or ref,
-                "issue_date": _clean_date(itm["issue_date"]),
-                "due_date": _clean_date(itm["due_date"]),
-                "section": itm["section"],
-                "personal_hearing": "",
                 "attachments": [
                     dl[str(d["id"])] for d in itm["descriptors"]
                     if str(d["id"]) in dl
                 ],
-            })
+            }
+            # Each group has its OWN field names downstream — a replies row is
+            # persisted from arn / reply_date / reply_filed_against, and an
+            # orders row from order_number / order_date. Emitting the notice
+            # shape for every group (what this did before) left the Replies
+            # table with only a Type and empty reference/date columns. Mirrors
+            # the per-group branch the litserv path already uses.
+            if grp == "replies":
+                item["arn"] = itm["ref_no"]
+                item["reply_date"] = _clean_date(itm["issue_date"])
+                item["reply_filed_against"] = itm["against_ref"]
+                item["personal_hearing"] = ""
+            elif grp == "orders":
+                item["order_number"] = itm["ref_no"]
+                item["order_date"] = _clean_date(itm["issue_date"])
+            else:
+                item["reference_number"] = itm["ref_no"] or ref
+                item["issue_date"] = _clean_date(itm["issue_date"])
+                item["due_date"] = _clean_date(itm["due_date"])
+                item["section"] = itm["section"]
+                item["personal_hearing"] = ""
+            groups.setdefault(grp, []).append(item)
 
         # Fallback: portal returned no parsable items — still record the task
         # itself so the notice is not lost.
