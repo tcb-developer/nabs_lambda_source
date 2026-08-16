@@ -647,23 +647,31 @@ def _loads(text, default):
     return val
 
 
-def _post(s, url, body):
+def _post(s, url, body, extra_headers=None):
     """POST a JSON chain API with bounded transient retry.
 
     Treats an EMPTY / non-JSON 200 body as RETRYABLE — under bulk load the GST
     portal returns HTTP 200 with an empty body, which previously slipped
     through (200 == success) and then crashed json.loads downstream. We now
     re-attempt; if every attempt is still empty, the caller's _loads() turns it
-    into an empty list/dict (treated as "no notices") rather than an error."""
+    into an empty list/dict (treated as "no notices") rather than an error.
+
+    `extra_headers` is merged LAST (so it can override Referer). It exists for
+    the audit path, whose browser calls carry the audit page's Referer plus an
+    `Authorization: Bearer` token alongside the usual `at:` header. Callers that
+    omit it get byte-identical behaviour to before."""
     last = (0, "")
     for attempt in range(1, _RETRY_ATTEMPTS + 1):
         try:
-            r = s.post(url, json=body, timeout=45, headers={
+            headers = {
                 "Content-Type": "application/json;charset=UTF-8",
                 "Accept": "application/json, text/plain, */*",
                 "Origin": SERVICES, "Referer": f"{SERVICES}/services/auth/notices",
                 "at": getattr(s, "_at", ""),
-            })
+            }
+            if extra_headers:
+                headers.update(extra_headers)
+            r = s.post(url, json=body, timeout=45, headers=headers)
             last = (r.status_code, r.text)
             if r.status_code == 200 and _looks_like_json(r.text):
                 return last
@@ -1004,7 +1012,350 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
             "issue_date": _clean_date(dt), "due_date": _clean_date(row.get("dueDate")),
             "amount": 0.0, "appln_id": None, "doc_id": None, "notice_letter": nl}}
 
+    def _audit_get(s, path):
+        """GET a foauditweb JSON API with bounded transient retry.
+
+        AUDIT cases are NOT served by the litserv chain the other case types
+        use — they live under `/foauditweb/auth/api/...`, which authenticates
+        with `Authorization: Bearer <AuthToken>` instead of litserv's `at:`
+        header. The session's current token is kept on `s._at` (rotated by the
+        keepalive thread), so we read it per call rather than caching.
+        """
+        url = f"{SERVICES}/foauditweb/auth/api{path}"
+        last = (0, "")
+        for attempt in range(1, _RETRY_ATTEMPTS + 1):
+            try:
+                tok = getattr(s, "_at", "") or ""
+                r = s.get(url, timeout=45, headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {tok}",
+                    "at": tok,
+                    "Referer": f"{SERVICES}/foauditweb/auth/audit/case/notice-folder",
+                })
+                last = (r.status_code, r.text)
+                if r.status_code == 200 and _looks_like_json(r.text):
+                    return last
+                if 400 <= r.status_code < 500:
+                    return last
+            except requests.RequestException:
+                last = (0, "")
+            if attempt < _RETRY_ATTEMPTS:
+                time.sleep(_RETRY_BACKOFF * attempt)
+        return last
+
+    # The audit module names its document lists differently from litserv:
+    # `mainDocuments` is the notice PDF itself, `inpData` / `docUploaded` are
+    # the officer's annexures/observations, and a FILED REPLY carries the
+    # taxpayer's own uploads under `strFormUpload`. Descriptor fields are
+    # id/fileName/type (litserv uses id/docName/ct). `docUploaded` is an empty
+    # STRING when absent, not an empty list — hence the isinstance guard.
+    _AUDIT_DOC_KEYS = ("mainDocuments", "inpData", "docUploaded", "strFormUpload")
+
+    # Last-resort human label per audit folder. Some items name themselves only
+    # by a code — the audit-plan item's `noticeType` is the literal string
+    # "ADPLN" — and the working-paper items carry no type field at all, which
+    # left their Type column blank. Applied ONLY when the item supplies no
+    # readable name of its own, so items that do name themselves are untouched.
+    _AUDIT_FOLDER_LABEL = {
+        "NOTCE": "Audit Notice", "REPLY": "Reply", "RTAUD": "Audit Report",
+        "PRCED": "Audit Proceeding", "PLAUD": "Audit Plan",
+        "WPAUD": "Audit Working Paper",
+    }
+
+    def _audit_doc_descriptor(d, source):
+        """Normalise one audit document dict to the keys the shared litserv
+        download path expects (id / docName / ct)."""
+        return {
+            "id": d.get("id"),
+            "docName": d.get("fileName") or str(d.get("id")),
+            "ct": d.get("type") or "",
+            "ty": source,
+        }
+
+    def _audit_walk_docs(node, out, seen, depth=0):
+        """Collect document descriptors ANYWHERE in a parsed audit blob.
+
+        Notice items keep their documents under the known `_AUDIT_DOC_KEYS`,
+        but REPLY items are a different form whose document key is not among
+        them. Rather than guess a name (guessing the notice keys was already
+        wrong once), recognise documents STRUCTURALLY: any dict carrying both
+        an `id` and a `fileName` is a portal document descriptor. Nothing else
+        in these payloads has that pair — the audit-report blob is full of
+        nested tax-amount dicts, and none of them carry a file name — so this
+        cannot false-positive on them.
+        """
+        if depth > 8:
+            return  # audit report blobs nest deeply; bound the walk
+        if isinstance(node, dict):
+            if node.get("id") and node.get("fileName"):
+                key = str(node.get("id"))
+                if key not in seen:
+                    seen.add(key)
+                    out.append(_audit_doc_descriptor(node, "walk"))
+                return
+            for v in node.values():
+                _audit_walk_docs(v, out, seen, depth + 1)
+        elif isinstance(node, list):
+            for v in node:
+                _audit_walk_docs(v, out, seen, depth + 1)
+
+    def _audit_item_docs(item_json):
+        """Return the document descriptors carried by one parsed itemJson,
+        normalised to the same keys the litserv download path expects."""
+        out, seen = [], set()
+        for key in _AUDIT_DOC_KEYS:
+            v = item_json.get(key)
+            if not isinstance(v, list):
+                continue  # "" / None / unexpected scalar
+            for d in v:
+                if isinstance(d, dict) and d.get("id"):
+                    seen.add(str(d.get("id")))
+                    out.append(_audit_doc_descriptor(d, key))
+        # Anything the known keys missed (reply attachments, and any future
+        # audit form that names its list differently).
+        _audit_walk_docs(item_json, out, seen)
+        return out
+
+    def _audit_items(items_raw):
+        """Normalise an audit itemDetails payload into per-item dicts.
+
+        `itemDetails` returns {"status","data":[...]} where each row carries
+        `itemJson` as a JSON **string** (the folder/items/get variant calls the
+        same blob `jdata`). Each parsed blob holds the notice's own metadata
+        plus its document lists.
+        """
+        rows = items_raw.get("data") if isinstance(items_raw, dict) else items_raw
+        parsed = []
+        for row in (rows or []):
+            if not isinstance(row, dict):
+                continue
+            blob = row.get("itemJson") or row.get("jdata")
+            if isinstance(blob, str):
+                try:
+                    blob = json.loads(blob)
+                except (ValueError, TypeError):
+                    blob = None
+            if not isinstance(blob, dict):
+                continue
+            # AUDIT_<FOLDER>_<SUBTYPE>, e.g. AUDIT_NOTCE_ADN63 (a notice),
+            # AUDIT_PRCED_ADCOA (a proceeding, no docs), AUDIT_REPLY_REPTOADJ
+            # (a filed reply) or AUDIT_RTAUD_ADRP0 (the ADT-02 audit report).
+            # `itemDetails` names this field caseCfItemMapId; the per-folder
+            # `items/get` call names it itemCode. Same convention either way.
+            map_id = (row.get("caseCfItemMapId") or row.get("itemCode") or "").upper()
+            folder_cd = map_id.split("_")[1] if map_id.count("_") >= 2 else ""
+
+            # A REPLY blob describes TWO things: the reply itself, and the
+            # notice it answers. Its `noticeDate` / `noticeType` belong to that
+            # NOTICE, so reading them first would stamp every reply with the
+            # notice's date and leave its own type blank. Replies therefore
+            # read their own fields first; everything else keeps the original
+            # order. On the portal's Reply Filed table these map to Reply Date
+            # and Reply Type, with `noticeDueDate` as "Original Due Date To
+            # Respond".
+            is_reply = folder_cd == "REPLY"
+            if is_reply:
+                item_type = blob.get("replyType") or row.get("itemDesc") or ""
+                issue_date = blob.get("replyDate") or ""
+            else:
+                # PRCED rows carry `proceedingType` instead of `noticeType`;
+                # working papers carry `wpType` / `wpDate`. Without these their
+                # Type column rendered blank.
+                item_type = (blob.get("noticeType") or row.get("itemDesc")
+                             or blob.get("noticeName") or blob.get("proceedingType")
+                             or blob.get("wpType") or "")
+                issue_date = (blob.get("noticeIssuedDate") or blob.get("noticeDate")
+                              or blob.get("proceedingDate") or blob.get("wpDate") or "")
+
+            # Fall back to the folder's label when the item named itself with
+            # nothing, or with the bare subtype code from its own map id
+            # (AUDIT_PLAUD_ADPLN reports its type as "ADPLN").
+            label = _AUDIT_FOLDER_LABEL.get(folder_cd, "")
+            subtype = map_id.rsplit("_", 1)[-1] if map_id.count("_") >= 2 else ""
+            if not item_type.strip() or item_type.strip().upper() == subtype:
+                item_type = label or item_type
+            elif label and blob.get("wpType"):
+                # "Trend Analysis" alone is meaningless in a notice list.
+                item_type = f"{label}: {item_type}"
+
+            parsed.append({
+                # itemDetails names it refId; a reply also repeats it inside
+                # its own blob as replyReferenceNumber.
+                "ref_no": row.get("refId") or blob.get("referenceNumber")
+                          or blob.get("replyReferenceNumber") or "",
+                "type": item_type,
+                "folder_cd": folder_cd,
+                "issue_date": issue_date,
+                "due_date": blob.get("noticeDueDate") or blob.get("dueDate") or "",
+                "section": blob.get("sectionNumber") or "",
+                "issued_by": blob.get("issuedByNm") or "",
+                "descriptors": _audit_item_docs(blob),
+            })
+        return parsed
+
+    def _do_audit_case(row):
+        """AUDIT case-task → notice row WITH its attachments.
+
+        Audit notices arrive in `case/task/get` like every other case type, but
+        their folders/items are served by the audit module, so the litserv
+        folder calls returned nothing and the notice was stored with zero
+        files. This mirrors `_do_case_task`'s output shape exactly so the
+        webhook/DB side needs no change.
+        """
+        ref, cid, arn = row.get("refId"), row.get("caseId"), row.get("arn")
+        ctype, gid = row.get("caseTpeCd"), row.get("gstIn")
+        groups = {k: [] for k in ("notices", "replies", "orders",
+                                  "intimations", "applications", "ack_intimations")}
+        files, fails = 0, []
+
+        # Case header — gives the portal's own status text / audit type / FY.
+        meta = {}
+        if arn:
+            stm, bm = _audit_get(s, f"/case/casedtls?arn={arn}")
+            meta = _loads(bm, {}) if stm == 200 else {}
+            if stm != 200:
+                fails.append(f"audit {ref}: casedtls HTTP {stm}")
+        if not cid:
+            cid = meta.get("caseId")
+        if not cid:
+            fails.append(f"audit {ref}: no caseId — cannot list folders")
+            return {"kind": "additional", "files": 0, "fails": fails, "row": None}
+
+        # Folders + items. Both are logged once per case at INFO so a single
+        # real run reveals the exact audit payload shape in CloudWatch.
+        stf, bf = _audit_get(s, f"/case/folder?caseId={cid}")
+        folders = _loads(bf, {}) if stf == 200 else {}
+        if isinstance(folders, dict):
+            folders = folders.get("data") or []
+        if stf != 200:
+            fails.append(f"audit {ref}: folder HTTP {stf}")
+        sti, bi = _audit_get(s, f"/case/folder/itemDetails?caseId={cid}")
+        items_raw = _loads(bi, {}) if sti == 200 else {}
+        if sti != 200:
+            fails.append(f"audit {ref}: itemDetails HTTP {sti}")
+        logger.info(
+            "AUDIT case %s (arn=%s) folders=%s itemDetails=%s",
+            cid, arn, str(folders)[:600], str(bi)[:1500],
+        )
+
+        items = _audit_items(items_raw)
+        descriptors = [d for itm in items for d in itm["descriptors"]]
+        # De-dupe by portal doc id — the same annexure is repeated across a
+        # notice and each of its reminders (e.g. Annexure.pdf on ADT-01 and on
+        # Rem1), so downloading per item would fetch it several times.
+        seen_ids, uniq = set(), []
+        for d in descriptors:
+            k = str(d["id"])
+            if k not in seen_ids:
+                seen_ids.add(k)
+                uniq.append(d)
+        descriptors = uniq
+
+        # Download via the SHARED portal document path (getEncrypDocIds +
+        # downloadhb). Confirmed against the portal: the audit page resolves its
+        # download hashes through LITSERV's getEncrypDocIds with the audit ARN —
+        # the endpoint is portal-wide, not litserv-page-specific. Only the auth
+        # headers differ (audit sends Bearer + its own Referer), so we send both
+        # that and the usual `at:`.
+        audit_referer = f"{SERVICES}/foauditweb/auth/audit/case/notice-folder?arnData={arn}"
+        dl = {}
+        if descriptors and arn:
+            ids = [str(d["id"]) for d in descriptors]
+            s3_, b3 = _post(s, f"{SERVICES}/litserv/auth/api/usr/getEncrypDocIds",
+                            {"arn": arn, "docIdList": ids},
+                            extra_headers={
+                                "Authorization": f"Bearer {getattr(s, '_at', '') or ''}",
+                                "Referer": audit_referer,
+                            })
+            enc = _loads(b3, {}) if s3_ == 200 else {}
+            if not enc:
+                fails.append(f"audit {ref}: getEncrypDocIds HTTP {s3_} — no download hashes")
+
+            def _fetch_audit_desc(d):
+                doc_name = d.get("docName") or str(d.get("id") or "")
+                pre_ext = _ext_pre_download(doc_name, d.get("ct") or "")
+                if pre_ext:
+                    reuse_key = _att_key(org_id, client_name, ref, pre_ext, doc_name)
+                    reused = reuse_existing_attachment(
+                        reuse_key, (doc_name or "").strip() or os.path.basename(reuse_key))
+                    if reused:
+                        return reused
+                eh = enc.get(str(d.get("id")))
+                if not eh:
+                    return None
+                url = f"{SERVICES}/downloadhb/download/new?docId={d['id']}&arn={arn}&eh={eh}"
+                st2_, mime2, data2 = _download(s, url, audit_referer)
+                ext = _doc_ext(data2, mime2, doc_name)
+                if not (st2_ == 200 and data2 and ext is not None):
+                    return None
+                return _upload(data2, org_id, client_name, ref, doc_name, mime2)
+
+            with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+                for d, att in zip(descriptors, ex.map(_fetch_audit_desc, descriptors)):
+                    if att:
+                        dl[str(d["id"])] = att
+            files = len(dl)
+            if descriptors and not dl:
+                fails.append(
+                    f"audit {ref}: {len(descriptors)} document(s) listed but none downloaded")
+
+        # One entry per PORTAL ITEM (the ADT-01, each reminder, the discrepancy
+        # notice ...), each carrying its OWN documents — mirroring how the
+        # litserv path emits one row per item rather than one per case.
+        # PRCED rows (audit proceedings) carry no documents but are still real
+        # portal rows, so they are kept for completeness.
+        for itm in items:
+            grp = "notices" if itm["folder_cd"] in ("NOTCE", "", "PRCED") else \
+                _classify_folder(ctype, itm["folder_cd"], "")
+            groups.setdefault(grp, []).append({
+                "type": itm["type"] or row.get("taskDesc") or "Audit",
+                "document_type": meta.get("statusDesc") or "",
+                "reference_number": itm["ref_no"] or ref,
+                "issue_date": _clean_date(itm["issue_date"]),
+                "due_date": _clean_date(itm["due_date"]),
+                "section": itm["section"],
+                "personal_hearing": "",
+                "attachments": [
+                    dl[str(d["id"])] for d in itm["descriptors"]
+                    if str(d["id"]) in dl
+                ],
+            })
+
+        # Fallback: portal returned no parsable items — still record the task
+        # itself so the notice is not lost.
+        if not items:
+            groups["notices"].append({
+                "type": row.get("taskDesc") or meta.get("caseName") or "Audit",
+                "document_type": meta.get("statusDesc") or "",
+                "reference_number": ref,
+                "issue_date": _clean_date(row.get("assignmentDt") or row.get("assgnDtStr")),
+                "due_date": None, "section": "", "personal_hearing": "",
+                "attachments": list(dl.values()),
+            })
+
+        # Case-level due date = latest due date across its Notices rows, the
+        # same rule the litserv path uses (ISO-cleaned, so max string = latest).
+        _audit_dues = [n.get("due_date") for n in groups.get("notices", []) if n.get("due_date")]
+
+        return {"kind": "additional", "files": files, "fails": fails, "row": {
+            "ref_id": ref, "arn": arn,
+            "type": row.get("caseTypeName") or ctype or "AUDIT",
+            "issue_date": _clean_date(row.get("assignmentDt") or row.get("assgnDtStr")),
+            "due_date": max(_audit_dues) if _audit_dues else None,
+            "description": row.get("taskDesc") or "",
+            "case_details": {
+                "reference_number": arn, "case_id": str(cid or ""), "gstin": gid,
+                "case_creation_date": _clean_date(
+                    row.get("assignmentDt") or row.get("insertTimeStamp")),
+                "status": meta.get("statusDesc") or row.get("status"),
+                **groups}}}
+
     def _do_case_task(row):
+        # AUDIT cases are served by the audit module, not litserv — route them
+        # before the litserv folder calls (which return nothing for them).
+        if (row.get("caseTpeCd") or "").strip().upper() == "AUDIT":
+            return _do_audit_case(row)
         ref, cid, arn = row.get("refId"), row.get("caseId"), row.get("arn")
         ctype, gid = row.get("caseTpeCd"), row.get("gstIn")
         groups = {k: [] for k in ("notices", "replies", "orders",
