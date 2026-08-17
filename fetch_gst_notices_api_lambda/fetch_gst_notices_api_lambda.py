@@ -1052,6 +1052,24 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
     # STRING when absent, not an empty list — hence the isinstance guard.
     _AUDIT_DOC_KEYS = ("mainDocuments", "inpData", "docUploaded", "strFormUpload")
 
+    # The audit payload lists the SAME document under several items, which made
+    # one notice's files appear on other notices. Verified on a real case: the
+    # ADT-01 carries its two annexures under `inpData` (and has no
+    # `docUploaded` at all), while BOTH of its reminders repeat those exact
+    # document ids under `docUploaded` — i.e. that key re-lists the PARENT
+    # notice's uploads for reference rather than holding the reminder's own.
+    #
+    # Each document therefore gets exactly ONE owning item, picked by how
+    # strongly the key claims ownership: an item's own primary document first,
+    # then documents it supplied itself, and a re-listed parent upload last.
+    # Nothing is ever dropped outright — a document reaching us only through a
+    # re-listing still belongs to whoever lists it. Equal-strength claims keep
+    # the first item in payload order, so the outcome is deterministic.
+    _AUDIT_DOC_KEY_RANK = {
+        "mainDocuments": 0, "strFormUpload": 1, "inpData": 2, "walk": 3,
+        "docUploaded": 4,
+    }
+
     # Last-resort human label per audit folder. Some items name themselves only
     # by a code — the audit-plan item's `noticeType` is the literal string
     # "ADPLN" — and the working-paper items carry no type field at all, which
@@ -1195,6 +1213,27 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                 "against_ref": blob.get("noticeReferenceNumber") or "",
                 "descriptors": _audit_item_docs(blob),
             })
+
+        # Ownership pass — case-level, so it runs once every item is known.
+        best = {}  # doc id -> (rank, item index) of its strongest claim
+        for idx, itm in enumerate(parsed):
+            for d in itm["descriptors"]:
+                claim = (_AUDIT_DOC_KEY_RANK.get(d["ty"], 9), idx)
+                key = str(d["id"])
+                if key not in best or claim < best[key]:
+                    best[key] = claim
+        for idx, itm in enumerate(parsed):
+            kept, seen = [], set()
+            # Strongest claim first, so an id listed under two keys on the SAME
+            # item is kept once, as the stronger of the two.
+            for d in sorted(itm["descriptors"],
+                            key=lambda d: _AUDIT_DOC_KEY_RANK.get(d["ty"], 9)):
+                key = str(d["id"])
+                if key in seen or best.get(key, (9, idx))[1] != idx:
+                    continue
+                seen.add(key)
+                kept.append(d)
+            itm["descriptors"] = kept
         return parsed
 
     def _do_audit_case(row):
