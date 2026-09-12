@@ -68,6 +68,12 @@ SESSION_KEEPALIVE_SECONDS = int(os.environ.get("SESSION_KEEPALIVE_SECONDS", "60"
 # (proceedings / notices / demands) that still failed after the first pass.
 # Env-tunable so a throttled account can be dialed down without a redeploy.
 FILE_DOWNLOAD_ATTEMPTS = max(1, int(os.environ.get("FILE_DOWNLOAD_ATTEMPTS", "5")))
+# Per-attempt timeout for the result callback to the NoticeAI backend. Was a
+# hard-coded 120 s x 2 attempts: when the backend was slow to answer (the
+# Aug 2026 callback bursts) every worker sat ~4 min in pure wait, which was
+# ~85% of the month's Lambda compute. The backend endpoint is enqueue-only
+# now and answers in well under a second, so 30 s is generous headroom.
+WEBHOOK_TIMEOUT_SECONDS = max(5, int(os.environ.get("WEBHOOK_TIMEOUT_SECONDS", "30")))
 PROCEEDING_RETRY_ROUNDS = max(0, int(os.environ.get("PROCEEDING_RETRY_ROUNDS", "2")))
 
 # ---------------------------------------------------------------------------
@@ -179,13 +185,35 @@ def _get_s3_client():
     return _s3_client
 
 
-def retry_request(method, url, max_retries=MAX_RETRIES, session=None, **kwargs):
+class NonJsonPortalResponse(ValueError):
+    """The portal answered 2xx but the body is not JSON (empty, or an HTML
+    error/login page). Raised by retry_request(expect_json=True) once the retry
+    budget is exhausted so callers record a precise error instead of json's
+    bare "Expecting value: line 1 column 1"."""
+
+
+def _body_looks_like_html(resp):
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    head = (resp.text or "")[:64].lstrip().lower()
+    return "text/html" in ctype or head.startswith("<!doctype") or head.startswith("<html")
+
+
+def retry_request(method, url, max_retries=MAX_RETRIES, session=None, expect_json=False, **kwargs):
     """Make an HTTP request with retry logic for transient failures.
 
     When `session` (a SessionHolder) is given and the portal returns a
     session-expired status (401/403/440 — 440 is its "Login Timeout"), refresh
     the login ONCE and retry with fresh cookies instead of blind-retrying the
     dead session. The refresh does not count against the transient-retry budget.
+
+    `expect_json=True` additionally treats a 2xx response whose body is not
+    JSON as a transient failure. The portal intermittently answers its JSON
+    endpoints with an empty body (rate limiting) or an HTML page (dead session
+    served as 200); before this, the caller's `.json()` blew up as
+    "Expecting value: line 1 column 1" and the whole e-proceeding was silently
+    skipped - ~2,900 times in the first 12 days of Sep 2026. An HTML body with
+    a session holder present triggers the same one-time login refresh as a
+    401/440; anything else is retried with the normal backoff.
     """
     kwargs.setdefault('timeout', timeout_sec)
     _sess = http_session()
@@ -210,8 +238,31 @@ def retry_request(method, url, max_retries=MAX_RETRIES, session=None, **kwargs):
                 continue
 
             resp.raise_for_status()
+
+            if expect_json:
+                try:
+                    resp.json()
+                except ValueError:
+                    snippet = (resp.text or "")[:120].replace("\n", " ")
+                    if _body_looks_like_html(resp) and session is not None and not refreshed:
+                        refreshed = True
+                        logger.warning(
+                            f"HTML body on JSON endpoint {url} (HTTP {resp.status_code}); "
+                            f"treating as expired session, refreshing login and retrying..."
+                        )
+                        new_cookies = session.refresh()
+                        if new_cookies is not None:
+                            kwargs['cookies'] = new_cookies.cookies
+                        time.sleep(1)
+                        continue
+                    raise NonJsonPortalResponse(
+                        f"Non-JSON body from {url} (HTTP {resp.status_code}, "
+                        f"{len(resp.content)} bytes): {snippet!r}"
+                    )
+
             return resp
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.HTTPError) as e:
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                requests.exceptions.HTTPError, NonJsonPortalResponse) as e:
             if attempt < max_retries:
                 logger.warning(f"Request attempt {attempt}/{max_retries} failed for {url}: {str(e)}. Retrying in {RETRY_DELAY}s...")
                 time.sleep(RETRY_DELAY * attempt)  # exponential backoff
@@ -351,7 +402,7 @@ def login_user_via_apis(username, password, client_name):
         res_1 = retry_request(
             "post",
             f"{base_url}/loginapi/login",
-            headers=headers_with_sn("wLoginService"), timeout=timeout_sec,
+            expect_json=True, headers=headers_with_sn("wLoginService"), timeout=timeout_sec,
             json={
                 "entity": username, "serviceName": "wLoginService"
             })
@@ -389,7 +440,7 @@ def login_user_via_apis(username, password, client_name):
         main_response = retry_request(
             "post",
             f"{base_url}/loginapi/login",
-            headers=headers_with_sn("loginService"),
+            expect_json=True, headers=headers_with_sn("loginService"),
             timeout=timeout_sec,
             json=login_data
         )
@@ -437,7 +488,7 @@ def login_user_via_apis(username, password, client_name):
                 main_response = retry_request(
                     "post",
                     f"{base_url}/loginapi/login",
-                    headers=headers_with_sn("loginService"),
+                    expect_json=True, headers=headers_with_sn("loginService"),
                     timeout=timeout_sec,
                     json=continue_data
                 )
@@ -739,7 +790,7 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
             "header": {
                 "formName": "FO-041_PCDNG"
             }},
-            headers=headers_with_sn("eProceedingsPaginatedService"), cookies=session.cookies.cookies, session=session)
+            expect_json=True, headers=headers_with_sn("eProceedingsPaginatedService"), cookies=session.cookies.cookies, session=session)
 
         res_4_data = res_4.json()
         e_proceedings_group = (res_4_data.get('eProceedingPaginatedRequests') or []) if res_4_data else []
@@ -819,7 +870,7 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                                     "procdngReqId": proceeding_req_id,
                                     "loggedInUserId": username,
                                     "header": {"formName": "FO-041_PCDNG"}
-                                }, headers=headers_with_sn("downloadClosureOrder"), cookies=session.cookies.cookies, session=session)
+                                }, expect_json=True, headers=headers_with_sn("downloadClosureOrder"), cookies=session.cookies.cookies, session=session)
                                 res_co_data = res_co.json() or {}
                                 sat_docs = res_co_data.get("satDocDetlList") or []
 
@@ -876,7 +927,7 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                         "header": {
                             "formName": "FO-041_PCDNG"
                         }
-                    }, headers=headers_with_sn("eProceedingDetailsService"), cookies=session.cookies.cookies, session=session)
+                    }, expect_json=True, headers=headers_with_sn("eProceedingDetailsService"), cookies=session.cookies.cookies, session=session)
                     res_5_data = res_5.json()
 
                     if not res_5_data:
@@ -946,7 +997,7 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                                     "header": {
                                         "formName": "FO-041_PCDNG"
                                     }
-                                }, cookies=_cookies_box["cookies"].cookies, headers=headers_with_sn("itbaResponseService"), session=session)
+                                }, cookies=_cookies_box["cookies"].cookies, expect_json=True, headers=headers_with_sn("itbaResponseService"), session=session)
 
                                 res_6_data = res_6.json()
                                 remark_notice_list = res_6_data.get('respRemrkAttLst', None)
@@ -1021,7 +1072,7 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                                 }
                             }
                             res_7 = retry_request('post', f"{base_url}/returnservicesapi/auth/saveEntity",
-                                json=notice_pdf_payload, headers=headers_with_sn("noticeletterpdf"), cookies=_cookies_box["cookies"].cookies, session=session)
+                                json=notice_pdf_payload, expect_json=True, headers=headers_with_sn("noticeletterpdf"), cookies=_cookies_box["cookies"].cookies, session=session)
 
                             res_7_data = res_7.json()
                             documents_res_7 = res_7_data.get("docMap", None)
@@ -1033,7 +1084,7 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                                     logger.warning(f"Empty docMap for notice {unique_e_pro_notice_id}, retry {docmap_attempt}/3 after {wait_time}s...")
                                     time.sleep(wait_time)
                                     res_7 = retry_request('post', f"{base_url}/returnservicesapi/auth/saveEntity",
-                                        json=notice_pdf_payload, headers=headers_with_sn("noticeletterpdf"), cookies=_cookies_box["cookies"].cookies, session=session)
+                                        json=notice_pdf_payload, expect_json=True, headers=headers_with_sn("noticeletterpdf"), cookies=_cookies_box["cookies"].cookies, session=session)
                                     res_7_data = res_7.json()
                                     documents_res_7 = res_7_data.get("docMap", None)
                                     if documents_res_7:
@@ -1178,7 +1229,7 @@ def fetch_demands(login_cookies, username, client_name, download_dir=".", downlo
                 "pan": username,
                 "serviceName": "outstandingDemand"
             },
-            headers=headers_with_sn("outstandingDemand"),
+            expect_json=True, headers=headers_with_sn("outstandingDemand"),
             cookies=session.cookies.cookies,
             session=session
         )
@@ -1456,7 +1507,7 @@ def send_worker_webhook(webhook_config, client_name, portal_type, result, execut
     
     for attempt in range(2):
         try:
-            response = requests.post(callback_url, headers=headers, json=payload, timeout=120)
+            response = requests.post(callback_url, headers=headers, json=payload, timeout=WEBHOOK_TIMEOUT_SECONDS)
             if response.status_code == 200:
                 logger.info(f"Webhook sent successfully for {client_name}")
                 return True
