@@ -536,6 +536,18 @@ def _is_bad_credentials(status, body_text):
     return ("auth_9002" in t) or ("auth_9003" in t)
 
 
+def _is_account_locked(body_text) -> bool:
+    """True when the portal has put this LOGIN under a temporary block and is no
+    longer evaluating the password at all. Verified live on 16-09-2026: after
+    a run of wrong-password attempts the portal answered
+    `{"url":"/","message":null,"errorCode":"SWEB_9014"}` for that username
+    with the CORRECT password and with a deliberately wrong one alike, while a
+    different username still got AUTH_9002. Retrying only prolongs the block,
+    and reporting it as "could not reach the portal" sent everyone looking at
+    the network instead of the account."""
+    return "sweb_9014" in (body_text or "").lower()
+
+
 def _login_once(username, password):
     """A single login attempt. Returns (session, None) on success, or
     (None, reason) where reason is "bad_credentials" (do NOT retry) or
@@ -581,6 +593,8 @@ def _login_once(username, password):
     logger.error("GST login: authenticate %s %s", r.status_code, r.text[:150])
     if _is_bad_credentials(r.status_code, r.text):
         return None, "bad_credentials"
+    if _is_account_locked(r.text):
+        return None, "account_locked"
     return None, "transient"
 
 
@@ -592,6 +606,11 @@ LOGIN_FAIL_BAD_CREDENTIALS = (
 LOGIN_FAIL_TRANSIENT = (
     "Could not reach the GST portal after multiple attempts. Please try again "
     "shortly."
+)
+LOGIN_FAIL_ACCOUNT_LOCKED = (
+    "The GST portal has temporarily locked this login after repeated failed "
+    "attempts. Check the saved password, wait for the portal to lift the lock "
+    "(or reset the password on the portal), then try again."
 )
 
 
@@ -609,6 +628,9 @@ def _login(username, password):
         if reason == "bad_credentials":
             logger.error("GST login: bad credentials — not retrying")
             return None, LOGIN_FAIL_BAD_CREDENTIALS
+        if reason == "account_locked":
+            logger.error("GST login: portal has locked this login (SWEB_9014) — not retrying")
+            return None, LOGIN_FAIL_ACCOUNT_LOCKED
         if attempt < _LOGIN_ATTEMPTS:
             logger.warning("GST login: transient failure, retrying (%d/%d)",
                            attempt, _LOGIN_ATTEMPTS)
