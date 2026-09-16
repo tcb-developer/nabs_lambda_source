@@ -197,6 +197,10 @@ def process_income_tax_client(client):
         # the event. It was previously dropped here, defeating the skip
         # optimisation so every fetch re-downloaded everything.
         'existing_notice_ids': client.get('existing_notice_ids', []),
+        # Stable '<type>|<DIN or comm-ref>' tokens (same source). The volatile
+        # ids above change across the FYA/FYI variants, so the worker also
+        # matches on these; forwarded here for the same reason as above.
+        'existing_notice_stable_ids': client.get('existing_notice_stable_ids', []),
         'webhook_config': client.get('webhook_config')
     }
     # Forward per-notice file-download concurrency to the worker (if set by

@@ -13,6 +13,7 @@ import traceback
 import logging
 import boto3
 from botocore.client import Config
+from botocore.exceptions import ClientError
 import mimetypes
 import random
 import string
@@ -334,7 +335,55 @@ def key_generator(file_name):
     return final_key
 
 
-def upload_to_s3(file_path, file_name="", cleanup=True):
+def deterministic_key(username, doc_id, file_name):
+    """Idempotent S3 key for ONE portal document of ONE taxpayer:
+        income_tax/<PAN>/<docId>/<sanitised file name>
+    The same document fetched again maps to the SAME key, so a re-fetch can
+    never mint a second copy. key_generator() above draws a fresh random key on
+    EVERY upload, which is how the same attachments piled up hundreds of times
+    in S3 (637 GB of byte-identical duplicates found on 14-09-2026). Keys are
+    per-PAN on purpose: two taxpayers receiving the same notice keep separate
+    objects. Returns None when any part is missing (caller falls back)."""
+    if not (username and doc_id and file_name):
+        return None
+    regex = re.compile('[^0-9a-zA-Z._-]')
+    san = lambda v: regex.sub('', str(v).strip().replace(" ", "_"))
+    parts = (san(username), san(doc_id), san(file_name))
+    if not all(parts):
+        return None
+    return "income_tax/" + "/".join(parts)
+
+
+def s3_object_size(key):
+    """Size of the object at `key` in S3, or None when it does not exist.
+    A real 404 is 'not there'; any other failure (403, network) is logged and
+    ALSO treated as 'not there' so the fetch still completes - the upload that
+    follows targets the same deterministic key, so no duplicate can result."""
+    try:
+        return _get_s3_client().head_object(Bucket=S3_BUCKET, Key=key).get("ContentLength")
+    except ClientError as e:
+        code = str(e.response.get("Error", {}).get("Code", ""))
+        if code not in ("404", "NoSuchKey", "NotFound"):
+            logger.warning(f"S3 head_object failed for {key} ({code}); will re-upload")
+        return None
+    except Exception as e:
+        logger.warning(f"S3 head_object error for {key}: {e}; will re-upload")
+        return None
+
+
+def presigned_url(key):
+    return _get_s3_client().generate_presigned_url(
+        'get_object', Params={'Bucket': S3_BUCKET, 'Key': key}, ExpiresIn=604799,
+    )
+
+
+def reuse_s3_object(key, file_name, file_size):
+    """Same shape as upload_to_s3() for an object that is ALREADY in S3."""
+    return {"file_name": file_name, "file_url": presigned_url(key), "content_hash": key,
+            "s3_key": key, "file_size": file_size or 0, "reused": True}
+
+
+def upload_to_s3(file_path, file_name="", cleanup=True, key=None):
     """Upload file to S3 and return file info with presigned URL.
     Uses shared S3 client for performance. Optionally deletes local file after upload."""
     file_url = None
@@ -347,7 +396,9 @@ def upload_to_s3(file_path, file_name="", cleanup=True):
 
     if not file_name:
         file_name = os.path.basename(file_path)
-    key = key_generator(file_name)
+    # `key` = deterministic per-document key (see deterministic_key); the random
+    # key_generator() is only the fallback for callers that cannot name one.
+    key = key or key_generator(file_name)
 
     try:
         s3_client.upload_file(
@@ -361,16 +412,7 @@ def upload_to_s3(file_path, file_name="", cleanup=True):
             }
         )
 
-        params = {
-            'Bucket': S3_BUCKET,
-            'Key': key,
-        }
-
-        file_url = s3_client.generate_presigned_url(
-            'get_object',
-            Params=params,
-            ExpiresIn=604799,
-        )
+        file_url = presigned_url(key)
 
         # Get file size for proper File record
         try:
@@ -668,6 +710,22 @@ def _download_one_document(doc_id, link_text, full_file_path, file_info,
         file_info['skipped'] = True
         return file_info
 
+    # IDEMPOTENT FETCH: this document already lives in S3 under its deterministic
+    # key -> reuse it. No portal download, no second S3 copy. (The skip lists
+    # upstream can miss - volatile ids - so this is the guarantee that a
+    # re-fetch never duplicates a file.)
+    det_key = deterministic_key(username, doc_id, link_text)
+    if det_key:
+        _size = s3_object_size(det_key)
+        if _size is not None:
+            _r = reuse_s3_object(det_key, link_text, _size)
+            file_info['downloaded'] = True
+            file_info['reused'] = True
+            file_info['s3_url'] = _r['file_url']
+            file_info['s3_key'] = _r['s3_key']
+            logger.info(f"{label} already in S3, reused (no download): {link_text}")
+            return file_info
+
     download_success = False
     _holder = cookies_box.get("session")
     for dl_attempt in range(1, FILE_DOWNLOAD_ATTEMPTS + 1):
@@ -721,7 +779,7 @@ def _download_one_document(doc_id, link_text, full_file_path, file_info,
 
             # Upload to S3
             try:
-                s3_result = upload_to_s3(full_file_path, link_text)
+                s3_result = upload_to_s3(full_file_path, link_text, key=det_key)
                 file_info['s3_url'] = s3_result.get('file_url')
                 file_info['s3_key'] = s3_result.get('content_hash')
                 logger.info(f"{label} uploaded to S3: {link_text}")
@@ -747,11 +805,38 @@ def _download_one_document(doc_id, link_text, full_file_path, file_info,
     return file_info
 
 
-def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_dir=".", downloaded_files=None, fyi=False, third_party=False, existing_notice_ids=None, password=None, file_download_concurrency=3):
+def stable_notice_ids(notice, proceeding_type_label):
+    """Portal-assigned STABLE ids of one notice as '<proceeding type>|<id>'
+    tokens (DIN and communication reference). Scoped by proceeding type because
+    Self and "Of Other PAN/TAN" can legitimately share a DIN - the same scoping
+    the backend dedups rows on."""
+    out = set()
+    for v in (notice.get('documentIdentificationNumber'), notice.get('documentReferenceId')):
+        if v and str(v).strip():
+            out.add(f"{proceeding_type_label}|{str(v).strip()}")
+    return out
+
+
+def _notice_known(notice, existing_notice_ids, existing_stable_ids, proceeding_type_label):
+    """Is this notice already stored by the backend (so the worker skips it)?
+    Matches on the volatile id (proceedingReqId-headerSeqNo) as before, OR on
+    a stable id. The volatile id changes between the FYA/FYI variants of the
+    same proceeding and the backend keeps only the latest one, so matching on
+    it alone missed the notice on every run and re-downloaded all its files."""
+    volatile = f"{notice.get('proceedingReqId')}-{notice.get('headerSeqNo')}"
+    if volatile in existing_notice_ids:
+        return True
+    if existing_stable_ids:
+        return bool(stable_notice_ids(notice, proceeding_type_label) & existing_stable_ids)
+    return False
+
+
+def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_dir=".", downloaded_files=None, fyi=False, third_party=False, existing_notice_ids=None, password=None, file_download_concurrency=3, existing_stable_ids=None):
     """Fetch e-proceedings data and return as dict"""
     if downloaded_files is None:
         downloaded_files = []
     existing_notice_ids = existing_notice_ids or set()
+    existing_stable_ids = existing_stable_ids or set()
 
     proceeding_status_flag = "FYI" if fyi else "FYA"
     proceeding_type_flag = "thirdParty" if third_party else "self"
@@ -936,7 +1021,8 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
 
                     # Check if ALL notices in this proceeding are already known — skip entire proceeding if so
                     all_notice_ids = [f"{n.get('proceedingReqId')}-{n.get('headerSeqNo')}" for n in res_5_data]
-                    new_notices = [nid for nid in all_notice_ids if nid not in existing_notice_ids]
+                    new_notices = [nid for nid, n in zip(all_notice_ids, res_5_data)
+                                   if not _notice_known(n, existing_notice_ids, existing_stable_ids, proceeding_type_label)]
                     if not new_notices:
                         logger.info(f"SKIP entire proceeding {proceeding_req_id}: all {len(all_notice_ids)} notices already in Frappe")
                         continue
@@ -965,7 +1051,7 @@ def fetch_e_proceedings(login_cookies, username, client_name, page_no, download_
                         unique_e_pro_notice_id = f"{notice.get('proceedingReqId')}-{notice.get('headerSeqNo')}"
 
                         # Skip notices that already exist in Frappe (saves API calls + download time)
-                        if unique_e_pro_notice_id in existing_notice_ids:
+                        if _notice_known(notice, existing_notice_ids, existing_stable_ids, proceeding_type_label):
                             logger.info(f"SKIP notice {unique_e_pro_notice_id} (already in Frappe)")
                             return None, local_errors
 
@@ -1272,7 +1358,18 @@ def fetch_demands(login_cookies, username, client_name, download_dir=".", downlo
                     'original_path': out_file_path
                 }
 
-                if download_dir and unique_file_name not in downloaded_files:
+                # Same idempotent-fetch rule as _download_one_document: the demand
+                # intimation is keyed by DIN + AY, so a re-fetch reuses the S3 copy.
+                det_key = deterministic_key(username, f"demand-{din_value}-{demand.get('itrAy')}", unique_file_name)
+                _existing_size = s3_object_size(det_key) if det_key else None
+                if _existing_size is not None:
+                    _r = reuse_s3_object(det_key, unique_file_name, _existing_size)
+                    file_info['downloaded'] = True
+                    file_info['reused'] = True
+                    file_info['s3_url'] = _r['file_url']
+                    file_info['s3_key'] = _r['s3_key']
+                    logger.info(f"Demand file already in S3, reused (no download): {unique_file_name}")
+                elif download_dir and unique_file_name not in downloaded_files:
                     order_id = base64.b64encode(out_file_path.encode()).decode()
                     demand_download_success = False
                     # Mirror the notice-file loop: multiple attempts with backoff,
@@ -1307,7 +1404,7 @@ def fetch_demands(login_cookies, username, client_name, download_dir=".", downlo
 
                             # Upload to S3
                             try:
-                                s3_result = upload_to_s3(full_file_path, unique_file_name)
+                                s3_result = upload_to_s3(full_file_path, unique_file_name, key=det_key)
                                 file_info['s3_url'] = s3_result.get('file_url')
                                 file_info['s3_key'] = s3_result.get('content_hash')
                                 logger.info(f"Demand file uploaded to S3: {unique_file_name}")
@@ -1364,7 +1461,7 @@ def fetch_demands(login_cookies, username, client_name, download_dir=".", downlo
         }
 
 
-def fetch_income_tax_notices_via_api(username, password, client_name, downloaded_files=None, existing_notice_ids=None, file_download_concurrency=3):
+def fetch_income_tax_notices_via_api(username, password, client_name, downloaded_files=None, existing_notice_ids=None, file_download_concurrency=3, existing_notice_stable_ids=None):
     """
     Main function to fetch Income Tax notices and demands
 
@@ -1374,6 +1471,8 @@ def fetch_income_tax_notices_via_api(username, password, client_name, downloaded
         client_name: Client identifier
         downloaded_files: List of already downloaded file names (optional)
         existing_notice_ids: Set of unique_e_pro_id values already in Frappe (skip re-downloading)
+        existing_notice_stable_ids: '<proceeding type>|<DIN or comm-ref>' tokens of the
+            notices already stored (stable skip; see _notice_known)
         file_download_concurrency: max parallel document downloads within ONE notice
             (bounded; default 3 — the IT portal RemoteDisconnects under load)
 
@@ -1392,6 +1491,7 @@ def fetch_income_tax_notices_via_api(username, password, client_name, downloaded
     if downloaded_files is None:
         downloaded_files = []
     existing_notice_ids_set = set(existing_notice_ids or [])
+    existing_stable_ids_set = set(existing_notice_stable_ids or [])
 
     # Static download directory for Lambda /tmp
     download_dir = "/tmp"
@@ -1457,7 +1557,8 @@ def fetch_income_tax_notices_via_api(username, password, client_name, downloaded
                         fyi=variant["fyi"], third_party=variant["third_party"],
                         existing_notice_ids=existing_notice_ids_set,
                         password=password,
-                        file_download_concurrency=file_download_concurrency
+                        file_download_concurrency=file_download_concurrency,
+                        existing_stable_ids=existing_stable_ids_set,
                     )
                     logger.info(f"Fetched Page-{page_no} E Proceedings ({variant['label']})")
 
@@ -1529,7 +1630,9 @@ def lambda_handler(event, context):
         "username": "PAN_NUMBER",
         "password": "PASSWORD",
         "client_name": "client_name",
-        "downloaded_files": []  # Optional list of already downloaded files
+        "downloaded_files": [],  # Optional list of already downloaded files
+        "existing_notice_ids": [],  # Optional: volatile ids (proceedingReqId-headerSeqNo) to skip
+        "existing_notice_stable_ids": []  # Optional: '<type>|<DIN or comm-ref>' tokens to skip
     }
     """
     handler_start_time = time.time()
@@ -1543,6 +1646,7 @@ def lambda_handler(event, context):
         client_name = event.get('client_name')
         downloaded_files = event.get('downloaded_files', [])
         existing_notice_ids = event.get('existing_notice_ids', [])
+        existing_notice_stable_ids = event.get('existing_notice_stable_ids', [])
         # Bounded per-notice file-download parallelism (System-Config tunable,
         # forwarded by the orchestrator). Default 3 — conservative because the
         # IT portal RemoteDisconnects under load.
@@ -1563,7 +1667,8 @@ def lambda_handler(event, context):
             client_name=client_name,
             downloaded_files=downloaded_files,
             existing_notice_ids=existing_notice_ids,
-            file_download_concurrency=file_download_concurrency
+            file_download_concurrency=file_download_concurrency,
+            existing_notice_stable_ids=existing_notice_stable_ids,
         )
 
         response = {
