@@ -1522,6 +1522,7 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                                   "intimations", "applications", "ack_intimations")}
         files = 0
         appeal_details = demand_details = None
+        case_fails = []
         if cid and arn and ctype and gid:
             st_, body_ = _post(s, f"{SERVICES}/litserv/auth/api/case/folder",
                                {"caseId": cid, "gstid": gid, "caseTypeCd": ctype})
@@ -1597,6 +1598,13 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                                     {"arn": arn, "docIdList": ids})
                     enc = _loads(b3, {}) if s3_ == 200 else {}
 
+                # A file that cannot be fetched used to vanish with no trace, so
+                # a client could silently miss documents (04-11-2026).
+                def _note_miss(doc_name, why):
+                    line = f"{ref} {doc_name}: {why}"
+                    logger.warning("GST attachment not fetched: %s", line)
+                    case_fails.append(line)
+
                 def fetch_desc(d):
                     doc_name = d.get("docName") or str(d.get("id") or "")
                     # REUSE: skip the portal download when a VALID copy already
@@ -1612,11 +1620,14 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                     doc_arn = d.get("_arn") or arn
                     eh = d.get("hash") if d.get("_arn") else enc.get(str(d.get("id")))
                     if not eh:
+                        _note_miss(doc_name, "no download hash from the portal")
                         return None
                     url = f"{SERVICES}/downloadhb/download/new?docId={d['id']}&arn={doc_arn}&eh={eh}"
                     st2_, mime2, data2 = _download(s, url, f"{SERVICES}/services/auth/notices")
                     ext = _doc_ext(data2, mime2, doc_name)
                     if not (st2_ == 200 and data2 and ext is not None):
+                        _note_miss(doc_name, f"HTTP {st2_}, {mime2 or 'no type'}, "
+                                             f"{len(data2 or b'')} bytes, starts {(data2 or b'')[:40]!r}")
                         return None
                     return _upload(data2, org_id, client_name, ref, doc_name, mime2)
 
@@ -1680,7 +1691,7 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
             n.get("due_date") for n in groups.get("notices", []) if n.get("due_date")
         ]
         _latest_due_date = max(_notice_due_dates) if _notice_due_dates else None
-        return {"kind": "additional", "files": files, "fails": [], "row": {
+        return {"kind": "additional", "files": files, "fails": case_fails, "row": {
             "ref_id": ref, "arn": arn, "type": row.get("caseTypeName") or ctype,
             "issue_date": _clean_date(
                 row.get("assignmentDt") or row.get("assgnDtStr") or row.get("dtOfIssue")
