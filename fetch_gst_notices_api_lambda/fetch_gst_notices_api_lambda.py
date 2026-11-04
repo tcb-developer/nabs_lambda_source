@@ -339,8 +339,16 @@ def _parse_doc_descriptors(item_json_str):
     """Walk an itemJson string for every document descriptor.
 
     Notices/replies list their files under `dcupdtls`; ORDER items (deemed
-    approval / acceptance / rejection) list theirs under `docupdtl` instead —
+    approval / acceptance / rejection) list theirs under `docupdtl` instead -
     both must be collected, else an order's attachments are silently dropped.
+
+    APPEAL APPLICATION items (APPEL_APLCN_APPLN) use neither: the filed appeal
+    sits under `docappeal`, its annexure under `docannexure`, and every other
+    supporting file in a `docothers` LIST. They also spell the file name
+    `docname` (lowercase), so it is copied to `docName`, the one key callers
+    filter and build S3 keys on. Fixing only the keys would still yield nothing.
+    Verified live on 04-11-2026 against one client: 39 documents on the portal,
+    28 found, and all 11 misses were appeal applications.
     """
     try:
         parsed = json.loads(item_json_str)
@@ -362,6 +370,14 @@ def _parse_doc_descriptors(item_json_str):
                                     found.append(item)
                                 else:
                                     walk(item)
+            # Appeal application files: single dicts (docappeal /
+            # docannexure) or a list (docothers).
+            for _key in ("docappeal", "docannexure", "docothers"):
+                if _key in obj:
+                    v = obj[_key]
+                    for item in (v if isinstance(v, list) else [v]):
+                        if isinstance(item, dict) and item.get("id"):
+                            found.append(item)
             for v in obj.values():
                 walk(v)
         elif isinstance(obj, list):
@@ -369,6 +385,9 @@ def _parse_doc_descriptors(item_json_str):
                 walk(item)
 
     walk(parsed)
+    for d in found:
+        if isinstance(d, dict) and not d.get("docName") and d.get("docname"):
+            d["docName"] = d["docname"]
     return found
 
 
@@ -702,6 +721,89 @@ def _download(s, url, referer):
         if attempt < _RETRY_ATTEMPTS:
             time.sleep(_RETRY_BACKOFF * attempt)
     return last
+
+
+def _litserv_get(s, path, params):
+    """GET a litserv appeal API. Returns parsed JSON, or None on any failure:
+    these calls add to a fetch, so they must never break it."""
+    try:
+        r = s.get(f"{SERVICES}/litserv/auth/api/{path}", params=params, timeout=45,
+                  headers={"Accept": "application/json, text/plain, */*",
+                           "Referer": f"{SERVICES}/litserv/auth/case/folder",
+                           "at": getattr(s, "_at", "")})
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        return json.loads(r.text)
+    except (ValueError, TypeError):
+        return None
+
+
+# An appeal's "Order Under Appeal" files live on the ORIGINAL case, not the
+# appeal: downloading them needs that case's arn (the appeal's own arn answers
+# 404, verified live 04-11-2026). `appeal/getcaseitemdtl` returns the order's
+# item, which carries both the arn and the file descriptors.
+_APPEAL_APPLICATION_ITEM = "APPEL_APLCN_APPLN"
+_APPEAL_APPLICATION_LABEL = "Appeal to Appellate Authority"
+_ORDER_UNDER_APPEAL_LABEL = {"DEMOR": "Order Under Appeal - Assessment Demand Order"}
+
+
+def _order_under_appeal(s, item_json_str):
+    """Return {ref_no, label, descriptors} for the order an appeal application
+    is filed against, or None when it cannot be resolved. Each descriptor is
+    tagged with `_arn`, the case that actually serves the file."""
+    orddtl = (_loads(item_json_str, {}) or {}).get("orddtl") or {}
+    ordnum = orddtl.get("ordnum")
+    if not ordnum:
+        return None
+    payload = _litserv_get(s, "appeal/getcaseitemdtl", {"refId": ordnum})
+    items = payload.get("items") if isinstance(payload, dict) else None
+    for it in items or []:
+        map_id = it.get("caseCfItemMapId") or ""
+        ij = it.get("itemJson") or ""
+        if map_id.startswith("APPEL_") or not isinstance(ij, str):
+            continue
+        order_arn = (_loads(ij, {}) or {}).get("arn")
+        descriptors = [d for d in _parse_doc_descriptors(ij)
+                       if d.get("id") and d.get("docName") and d.get("hash")]
+        if not (order_arn and descriptors):
+            continue
+        for d in descriptors:
+            d["_arn"] = order_arn
+        return {
+            "ref_no": ordnum,
+            "label": _ORDER_UNDER_APPEAL_LABEL.get(
+                orddtl.get("ordtyp"), "Order Under Appeal"),
+            "descriptors": descriptors,
+        }
+    return None
+
+
+def _appeal_and_demand_details(s, item_json_str):
+    """Appeal + demand details for an appeal application, kept for later use
+    (no screen shows them yet). Returns (appeal_details, demand_details).
+
+    Chosen fields, not the raw payloads: those repeat this item's JSON and carry
+    PAN values (authdtls.pan, authdtls.auth, orddtl.todtls.pn).
+    """
+    item = _loads(item_json_str, {}) or {}
+    orddtl = item.get("orddtl") or {}
+    ordnum = orddtl.get("ordnum")
+    if not ordnum:
+        return None, None
+    appeal = {k: item.get(k) for k in (
+        "arn", "aplnum", "aplsts", "isMFY", "issuecat", "initamtorign")}
+    appeal["order"] = {k: v for k, v in orddtl.items() if k != "todtls"}
+    appeal["filed_on"] = (item.get("authdtls") or {}).get("dt")
+    status = _litserv_get(s, "appeal/getPrvsAplDtlsForSimulApl",
+                          {"refId": ordnum, "ordtyp": orddtl.get("ordtyp")})
+    if isinstance(status, dict):
+        appeal["status"] = {k: v for k, v in status.items()
+                            if k != "relevantAplItems"}
+    demand = _litserv_get(s, "appeal/getLiabilityDetails", {"refLiabId": ordnum})
+    return appeal, demand if isinstance(demand, list) else None
 
 
 def _upload(data, org_id, client_id, ref_id, doc_name, mime):
@@ -1419,6 +1521,7 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
         groups = {k: [] for k in ("notices", "replies", "orders",
                                   "intimations", "applications", "ack_intimations")}
         files = 0
+        appeal_details = demand_details = None
         if cid and arn and ctype and gid:
             st_, body_ = _post(s, f"{SERVICES}/litserv/auth/api/case/folder",
                                {"caseId": cid, "gstid": gid, "caseTypeCd": ctype})
@@ -1468,10 +1571,25 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                             ),
                             "dates": dates, "descriptors": descriptors,
                         })
+                        # An appeal application also shows the order it is
+                        # filed against, as its own Type of Documents row.
+                        if it.get("caseCfItemMapId") == _APPEAL_APPLICATION_ITEM:
+                            item_list[-1]["dtype"] = _APPEAL_APPLICATION_LABEL
+                            appeal_details, demand_details = _appeal_and_demand_details(s, ij)
+                            order = _order_under_appeal(s, ij)
+                            if order:
+                                item_list.append({
+                                    "fname": fname, "grp": grp,
+                                    "ref_no": order["ref_no"],
+                                    "dtype": order["label"], "order_type": "",
+                                    "dates": {},
+                                    "descriptors": order["descriptors"],
+                                })
 
             if item_list:
                 ids = list({
                     str(d["id"]) for itm in item_list for d in itm["descriptors"]
+                    if not d.get("_arn")  # served by its own case, see below
                 })
                 enc = {}
                 if ids:
@@ -1491,10 +1609,11 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                         )
                         if reused:
                             return reused
-                    eh = enc.get(str(d.get("id")))
+                    doc_arn = d.get("_arn") or arn
+                    eh = d.get("hash") if d.get("_arn") else enc.get(str(d.get("id")))
                     if not eh:
                         return None
-                    url = f"{SERVICES}/downloadhb/download/new?docId={d['id']}&arn={arn}&eh={eh}"
+                    url = f"{SERVICES}/downloadhb/download/new?docId={d['id']}&arn={doc_arn}&eh={eh}"
                     st2_, mime2, data2 = _download(s, url, f"{SERVICES}/services/auth/notices")
                     ext = _doc_ext(data2, mime2, doc_name)
                     if not (st2_ == 200 and data2 and ext is not None):
@@ -1574,7 +1693,9 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                     row.get("assignmentDt") or row.get("insertTimeStamp")
                     or row.get("assgnDtStr")
                 ),
-                "status": row.get("status"), **groups}}}
+                "status": row.get("status"),
+                "appeal_details": appeal_details,
+                "demand_details": demand_details, **groups}}}
 
     # Build the row-task list: Normal notices + GSTR-3A + Additional case-tasks
     # all fan out in ONE pool (the validated parallel-fetch flow).
