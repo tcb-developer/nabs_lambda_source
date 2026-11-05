@@ -704,23 +704,77 @@ def _post(s, url, body, extra_headers=None):
     return last
 
 
-def _download(s, url, referer):
-    """GET a document with bounded transient retry."""
+# Documents get their own retry budget: a dropped connection was the cause of
+# the files seen missing on production (HTTP 0 on all attempts, 04-11-2026).
+_DOWNLOAD_ATTEMPTS = 4
+_DOWNLOAD_BACKOFF = 2.0  # seconds, x attempt
+# The end-of-run second pass stops starting new files after this long, so it
+# cannot push a Lambda run past its timeout and lose the whole result callback.
+_SECOND_PASS_LIMIT_SECONDS = 120
+_SECOND_PASS_ATTEMPTS = 2
+
+
+def _download_error_label(e):
+    """Exception type + message, without the URL's query (it holds the download
+    hash). Carried in the content-type slot of a status-0 result."""
+    text = re.sub(r"\?\S*", "", str(e))
+    return f"{type(e).__name__}: {text}"[:140]
+
+
+def _download(s, url, referer, attempts=_DOWNLOAD_ATTEMPTS):
+    """GET a document with bounded transient retry. Returns the first response
+    that looks like a real document (200, non-empty, not an HTML page); retries
+    a dropped connection, 5xx, empty body, HTML page or timeout; a real 4xx is
+    returned as-is. Status 0 means no response arrived at all, and the second
+    value then says why."""
     last = (0, "", b"")
-    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         try:
-            r = s.get(url, timeout=60, headers={"Accept": "application/pdf,*/*",
-                                                "Referer": referer})
+            r = s.get(url, timeout=(10, 45), headers={"Accept": "application/pdf,*/*",
+                                                      "Referer": referer})
             last = (r.status_code, r.headers.get("Content-Type", ""), r.content)
-            if r.status_code == 200 and r.content:
+            if r.status_code == 200 and r.content and r.content[:1] != b"<":
                 return last
             if 400 <= r.status_code < 500:
                 return last
-        except requests.RequestException:
-            last = (0, "", b"")
-        if attempt < _RETRY_ATTEMPTS:
-            time.sleep(_RETRY_BACKOFF * attempt)
+        except requests.RequestException as e:
+            last = (0, _download_error_label(e), b"")
+        if attempt < attempts:
+            time.sleep(_DOWNLOAD_BACKOFF * attempt)
     return last
+
+
+def _retry_missed_files(results, stats, started):
+    """Second pass over the files the parallel pool could not fetch, one at a
+    time and only for what is still missing. Each file that stays missing is
+    recorded as a failure on the run."""
+    recovered = missed = 0
+    for r in results:
+        got = {}
+        for p in r.pop("pending", None) or []:
+            key = p["doc_id"]
+            if key not in got:
+                att = None
+                why = p["why"]
+                if time.monotonic() - started > _SECOND_PASS_LIMIT_SECONDS:
+                    why += " (second pass skipped: out of time)"
+                else:
+                    try:
+                        att = p["fetch"]()
+                    except Exception as e:
+                        why += f" (second pass: {type(e).__name__})"
+                got[key] = att
+                if att:
+                    r["files"] = r.get("files", 0) + 1
+                    recovered += 1
+                else:
+                    missed += 1
+                    logger.warning("GST attachment still missing after second pass: %s", why)
+                    r.setdefault("fails", []).append(why)
+            if got[key]:
+                p["atts"].append(got[key])
+    stats["second_pass_recovered"] = recovered
+    stats["second_pass_missed"] = missed
 
 
 def _litserv_get(s, path, params):
@@ -1522,7 +1576,7 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                                   "intimations", "applications", "ack_intimations")}
         files = 0
         appeal_details = demand_details = None
-        case_fails = []
+        pending, miss_reasons = [], {}
         if cid and arn and ctype and gid:
             st_, body_ = _post(s, f"{SERVICES}/litserv/auth/api/case/folder",
                                {"caseId": cid, "gstid": gid, "caseTypeCd": ctype})
@@ -1600,12 +1654,12 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
 
                 # A file that cannot be fetched used to vanish with no trace, so
                 # a client could silently miss documents (04-11-2026).
-                def _note_miss(doc_name, why):
+                def _note_miss(d, doc_name, why):
                     line = f"{ref} {doc_name}: {why}"
                     logger.warning("GST attachment not fetched: %s", line)
-                    case_fails.append(line)
+                    miss_reasons[str(d.get("id"))] = line
 
-                def fetch_desc(d):
+                def fetch_desc(d, attempts=_DOWNLOAD_ATTEMPTS):
                     doc_name = d.get("docName") or str(d.get("id") or "")
                     # REUSE: skip the portal download when a VALID copy already
                     # exists at the deterministic org+client+ref key.
@@ -1620,13 +1674,14 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                     doc_arn = d.get("_arn") or arn
                     eh = d.get("hash") if d.get("_arn") else enc.get(str(d.get("id")))
                     if not eh:
-                        _note_miss(doc_name, "no download hash from the portal")
+                        _note_miss(d, doc_name, "no download hash from the portal")
                         return None
                     url = f"{SERVICES}/downloadhb/download/new?docId={d['id']}&arn={doc_arn}&eh={eh}"
-                    st2_, mime2, data2 = _download(s, url, f"{SERVICES}/services/auth/notices")
+                    st2_, mime2, data2 = _download(s, url, f"{SERVICES}/services/auth/notices",
+                                                   attempts=attempts)
                     ext = _doc_ext(data2, mime2, doc_name)
                     if not (st2_ == 200 and data2 and ext is not None):
-                        _note_miss(doc_name, f"HTTP {st2_}, {mime2 or 'no type'}, "
+                        _note_miss(d, doc_name, f"HTTP {st2_}, {mime2 or 'no type'}, "
                                              f"{len(data2 or b'')} bytes, starts {(data2 or b'')[:40]!r}")
                         return None
                     return _upload(data2, org_id, client_name, ref, doc_name, mime2)
@@ -1654,6 +1709,15 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                     grp, dates = itm["grp"], itm["dates"]
                     atts = [dl[str(d["id"])] for d in itm["descriptors"]
                             if str(d["id"]) in dl]
+                    # Missed files get a second try at the end of the run, when
+                    # nothing else is downloading.
+                    for d in itm["descriptors"]:
+                        if str(d["id"]) not in dl:
+                            pending.append({
+                                "doc_id": str(d["id"]), "atts": atts,
+                                "why": miss_reasons.get(str(d["id"])) or f"{ref} {d.get('docName')}: not fetched",
+                                "fetch": (lambda d=d: fetch_desc(d, attempts=_SECOND_PASS_ATTEMPTS)),
+                            })
                     # `type` = the portal's per-item type (e.g. NOTICE /
                     # ADJOURNMENT from sdtls.*.type), falling back to the folder
                     # name only when absent. `document_type` is the portal's
@@ -1691,7 +1755,7 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
             n.get("due_date") for n in groups.get("notices", []) if n.get("due_date")
         ]
         _latest_due_date = max(_notice_due_dates) if _notice_due_dates else None
-        return {"kind": "additional", "files": files, "fails": case_fails, "row": {
+        return {"kind": "additional", "files": files, "fails": [], "pending": pending, "row": {
             "ref_id": ref, "arn": arn, "type": row.get("caseTypeName") or ctype,
             "issue_date": _clean_date(
                 row.get("assignmentDt") or row.get("assgnDtStr") or row.get("dtOfIssue")
@@ -1743,6 +1807,7 @@ def process_gst_notices(client_name, username, password, org_id, gstin_db=None,
                         files_count += r.get("files", 0)
                 except Exception as e:
                     stats["failures"].append(f"row task error: {e}")
+        _retry_missed_files(results, stats, phase_t0)
     finally:
         _keepalive.stop()
     stats["fetch_seconds"] = round(time.monotonic() - phase_t0, 2)
